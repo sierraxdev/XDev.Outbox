@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="LICENSE.md" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/Example/Example.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/XDev.Outbox.EFCore/XDev.Outbox.EFCore.csproj" />
+    <Project Path="src/XDev.Outbox.ServiceBus/XDev.Outbox.ServiceBus.csproj" />
+    <Project Path="src/XDev.Outbox/XDev.Outbox.csproj" />
+  </Folder>
+</Solution>
