@@ -31,6 +31,7 @@ namespace XDev.Outbox.EFCore
         protected override void OnModelCreating(ModelBuilder builder)
         {
             var outboxOptions = ((IOptions<OutboxDbContextConfiguration>)this.GetService<IServiceProvider>()?.GetService(typeof(IOptions<OutboxDbContextConfiguration>)))?.Value;
+            var outboxOptions = ((IOptions<OutboxDbContextConfiguration>)(internalServiceProvider.GetService(typeof(IOptions<OutboxDbContextConfiguration>))
             builder.Entity<OutboxMessage<TKey>>(config =>
             {
                 config.ToTable(outboxOptions?.TableName ?? nameof(OutboxMessage));
