@@ -17,8 +17,8 @@ namespace Example
             var configuration = new ConfigurationBuilder()
                 .SetBasePath(Path.Combine(Directory.GetCurrentDirectory()))
                 .AddJsonFile("appsettings.json", optional: false)
-            .AddJsonFile($"appsettings.{envName}.json", optional: true)
-            .Build();
+                .AddJsonFile($"appsettings.{envName}.json", optional: true)
+                .Build();
 
             var serviceCollection = new ServiceCollection();
             serviceCollection.AddDbContext<ApplicationDbContext>((provider, options) =>

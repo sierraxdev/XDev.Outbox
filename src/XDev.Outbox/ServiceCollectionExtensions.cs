@@ -34,7 +34,10 @@ namespace Microsoft.Extensions.DependencyInjection
                 throw new ArgumentException("No assemblies found to scan. Supply at least one assembly to scan for handlers.");
             }
 
-            services.AddOptions<OutboxConfiguration>().Configure<IServiceProvider>((options, sp) => configuration?.Invoke(options));
+            if (!services.Any(d => d.ServiceType == typeof(Options.IConfigureOptions<OutboxConfiguration>)))
+            {
+                services.AddOptions<OutboxConfiguration>().Configure<IServiceProvider>((options, sp) => configuration?.Invoke(options));
+            }
 
             var assignTypeFrom = typeof(ISubscriber<>);
             var subscribers = assemblies.SelectMany(x => x.GetTypes().Where(t => t.IsClass && !t.IsAbstract && (assignTypeFrom.IsAssignableFrom(t) || assignTypeFrom.IsGenericTypeDefinition && DoesTypeImplementOpenGeneric(t, assignTypeFrom))))
@@ -45,11 +48,11 @@ namespace Microsoft.Extensions.DependencyInjection
                     var isMatch = type.IsGenericType && ((Type)criteria).IsAssignableFrom(type.GetGenericTypeDefinition());
                     return isMatch;
                 }, typeof(ISubscriber<>)))
-                    services.AddScoped(findInterface, subscriber);
+                    services.TryAddScoped(findInterface, subscriber);
 
-            services.AddScoped<IEventPublisher, EventPublisher>();
-            services.AddScoped<IOutbox, Outbox>();
-            services.AddSingleton<IMessageQueue<TKey>, MemoryMessageQueue<TKey>>();
+            services.TryAddScoped<IEventPublisher, EventPublisher>();
+            services.TryAddScoped<IOutbox, Outbox>();
+            services.TryAddSingleton<IMessageQueue<TKey>, MemoryMessageQueue<TKey>>();
             services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, OutboxProcessorHostedService<TKey>>());
 
             return services;
@@ -76,7 +79,10 @@ namespace Microsoft.Extensions.DependencyInjection
                 throw new ArgumentException("No assemblies found to scan. Supply at least one assembly to scan for handlers.");
             }
 
-            services.AddOptions<OutboxConfiguration>().Configure<IServiceProvider>((options, sp) => configuration?.Invoke(options));
+            if (!services.Any(d => d.ServiceType == typeof(Options.IConfigureOptions<OutboxConfiguration>)))
+            {
+                services.AddOptions<OutboxConfiguration>().Configure<IServiceProvider>((options, sp) => configuration?.Invoke(options));
+            }
 
             var assignTypeFrom = typeof(ISubscriber<>);
             var subscribers = assemblies.SelectMany(x => x.GetTypes().Where(t => t.IsClass && !t.IsAbstract && (assignTypeFrom.IsAssignableFrom(t) || assignTypeFrom.IsGenericTypeDefinition && DoesTypeImplementOpenGeneric(t, assignTypeFrom))))
@@ -87,11 +93,11 @@ namespace Microsoft.Extensions.DependencyInjection
                     var isMatch = type.IsGenericType && ((Type)criteria).IsAssignableFrom(type.GetGenericTypeDefinition());
                     return isMatch;
                 }, typeof(ISubscriber<>)))
-                    services.AddScoped(findInterface, subscriber);
+                    services.TryAddScoped(findInterface, subscriber);
 
-            services.AddScoped<IEventPublisher, EventPublisher>();
-            services.AddScoped<IOutbox, Outbox>();
-            services.AddSingleton<IMessageQueue<TKey>, MemoryMessageQueue<TKey>>();
+            services.TryAddScoped<IEventPublisher, EventPublisher>();
+            services.TryAddScoped<IOutbox, Outbox>();
+            services.TryAddSingleton<IMessageQueue<TKey>, MemoryMessageQueue<TKey>>();
             services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, OutboxProcessorHostedService<TKey>>());
 
             return services;

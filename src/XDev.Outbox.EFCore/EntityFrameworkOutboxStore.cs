@@ -77,7 +77,7 @@ namespace XDev.Outbox.EFCore
                 queryBuilder.AppendLine("SELECT * FROM cte;");
             }
 
-            var results = await _dbContext.OutboxMessage
+            var results = await _dbContext.OutboxMessages
                 .FromSqlRaw(queryBuilder.ToString(), @params.ToArray())
                 .AsNoTracking()
                 .ToListAsync(cancellationToken);
@@ -87,13 +87,13 @@ namespace XDev.Outbox.EFCore
 
         public Task RemoveAsync(OutboxMessage<TKey> message, CancellationToken cancellationToken = default)
         {
-            _dbContext.OutboxMessage.Remove(message);
+            _dbContext.OutboxMessages.Remove(message);
             return _dbContext.SaveChangesAsync(cancellationToken);
         }
 
         public Task UpdateAsync(OutboxMessage<TKey> message, CancellationToken cancellationToken = default)
         {
-            _dbContext.OutboxMessage.Update(message);
+            _dbContext.OutboxMessages.Update(message);
             return _dbContext.SaveChangesAsync(cancellationToken);
         }
     }
