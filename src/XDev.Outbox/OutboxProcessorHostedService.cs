@@ -22,6 +22,23 @@ namespace XDev.Outbox
         private TimeSpan MonitorInterval => TimeSpan.FromMinutes(30);
         private TimeSpan ErrorInterval => TimeSpan.FromMinutes(5);
 
+#if NET8_0_OR_GREATER
+        private readonly TimeProvider _timeProvider;
+
+        public OutboxProcessorHostedService(IMessageQueue<TKey> queue,
+            ILogger<OutboxProcessorHostedService<TKey>> logger,
+            IServiceScopeFactory serviceScopeFactory,
+            IOptions<OutboxConfiguration> config,
+            TimeProvider timeProvider)
+        {
+            _queue = queue;
+            _logger = logger;
+            _serviceScopeFactory = serviceScopeFactory;
+            _config = config.Value;
+            _timeProvider = timeProvider;
+        }
+        private DateTime GetUtcNow() => _timeProvider.GetUtcNow().DateTime;
+#else
         public OutboxProcessorHostedService(IMessageQueue<TKey> queue,
             ILogger<OutboxProcessorHostedService<TKey>> logger,
             IServiceScopeFactory serviceScopeFactory,
@@ -32,6 +49,9 @@ namespace XDev.Outbox
             _serviceScopeFactory = serviceScopeFactory;
             _config = config.Value;
         }
+
+        private DateTime GetUtcNow() => DateTime.UtcNow;
+#endif
 
         protected override async Task ExecuteAsync(CancellationToken cancellationToken)
         {
@@ -52,7 +72,7 @@ namespace XDev.Outbox
                         var outboxStore = scope.ServiceProvider.GetRequiredService<IOutboxStore<TKey>>();
                         var messageQueue = scope.ServiceProvider.GetRequiredService<IMessageQueue<TKey>>();
 
-                        var pendingMessages = await outboxStore.GetAllAsync(ProcessorItemsCount + 1, DateTime.UtcNow + _config.MessageLockExpirationTimeSpan, _config?.MaxAttemps ?? DefaultMaxAttemps, cancellationToken);
+                        var pendingMessages = await outboxStore.GetAllAsync(ProcessorItemsCount + 1, GetUtcNow() + _config.MessageLockExpirationTimeSpan, _config?.MaxAttemps ?? DefaultMaxAttemps, cancellationToken);
 
                         foreach (var item in pendingMessages)
                         {

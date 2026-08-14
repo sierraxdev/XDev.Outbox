@@ -54,6 +54,7 @@ namespace Microsoft.Extensions.DependencyInjection
             services.TryAddScoped<IOutbox, Outbox>();
             services.TryAddSingleton<IMessageQueue<TKey>, MemoryMessageQueue<TKey>>();
             services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, OutboxProcessorHostedService<TKey>>());
+            services.TryAddSingleton(TimeProvider.System);
 
             return services;
         }
