@@ -22,7 +22,8 @@ namespace XDev.Outbox
 
             foreach (var subscriber in (IEnumerable<object>)_serviceProvider.GetService(genericEnumerable))
             {
-                MethodInfo method = subscriber.GetType().GetMethod(nameof(ISubscriber<TEvent>.HandleEventAsync));
+                MethodInfo method = subscriber.GetType().GetMethod(nameof(ISubscriber<TEvent>.HandleEventAsync), new Type[] { @event.GetType(), typeof(CancellationToken) });
+                //MethodInfo method = subscriber.GetType().GetMethod(nameof(ISubscriber<TEvent>.HandleEventAsync));
                 await (Task)method.Invoke(subscriber, new object[] { @event, cancellationToken });
             }
         }
