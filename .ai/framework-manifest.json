@@ -1,0 +1,83 @@
+{
+    "framework":  "ai-engineering-framework",
+    "manifestVersion":  2,
+    "harness":  "claude-code",
+    "frameworkVersion":  {
+                             "commit":  "96d319252faa33ccb5e76d8c253b15d4d55070fd",
+                             "uncommittedChanges":  false
+                         },
+    "generated":  [
+                      {
+                          "path":  ".claude/agents/developer.md",
+                          "sha256":  "6ac745c7c6a4889ab57aa41fb8af15ca455f57398b4766e7253d7ce510946cf0"
+                      },
+                      {
+                          "path":  ".claude/agents/legacy-parity.md",
+                          "sha256":  "e8788a9dc4aafac025e58601fe30289fdeb7bfca618ae7765ac80388e092a66e"
+                      },
+                      {
+                          "path":  ".claude/agents/orchestrator.md",
+                          "sha256":  "ad8a7a827bd8465372e140db5f7ab61443d2d31d6a2ae6043981708790dc6983"
+                      },
+                      {
+                          "path":  ".claude/agents/planner.md",
+                          "sha256":  "a6d9b7ea3fefc6d601b36cdd6a58399acc4f8782a520d0449dfe1bea758d019e"
+                      },
+                      {
+                          "path":  ".claude/agents/reviewer.md",
+                          "sha256":  "9bc50573ebee5484d0dfdbed4d38d0a4979aeeac042a291a6203a016b267faa8"
+                      },
+                      {
+                          "path":  ".claude/agents/tester.md",
+                          "sha256":  "5d08a1eb4470a7ed95c8c6eb693d4f8cf95981c7dfb56333f3b849830384d620"
+                      },
+                      {
+                          "path":  ".claude/rules/ai-engineering.md",
+                          "sha256":  "7bd53964adecfdae675e7c871ef335555b460986354d961c02d76feb70ea4bd3"
+                      },
+                      {
+                          "path":  ".claude/skills/bootstrap-knowledge/SKILL.md",
+                          "sha256":  "0e4099d9624a4386ba6ba7d7792620d8d084dc2bc0edce32d62f9f4dc7200130"
+                      },
+                      {
+                          "path":  ".claude/skills/bug-fix/SKILL.md",
+                          "sha256":  "c7541b9d5cd894c80a2bba89b4028780c1d94a0c906a18db00eeab884314ace3"
+                      },
+                      {
+                          "path":  ".claude/skills/code-review/SKILL.md",
+                          "sha256":  "419721354e850c2d782980ab394c89e43793ea731c362d2e330b4a434ef9edc1"
+                      },
+                      {
+                          "path":  ".claude/skills/feature/SKILL.md",
+                          "sha256":  "a86b3b4fea801cf76539cf443a6fc380f75b73b113a50a97631915484dba66e3"
+                      },
+                      {
+                          "path":  ".claude/skills/investigate/SKILL.md",
+                          "sha256":  "ec487ed5fa0047b93141b100da39270d24ea5b62ba0abc49ec899bf7efa455a2"
+                      },
+                      {
+                          "path":  ".claude/skills/migration/SKILL.md",
+                          "sha256":  "8cac9263bc7c8152920a113559d1e8ca2c6f2785fe34b2c646832add3045cc02"
+                      },
+                      {
+                          "path":  ".claude/skills/parity/SKILL.md",
+                          "sha256":  "ef22fc040f1476188d7709308cace7247f1251701804621a58d293c4806799a3"
+                      },
+                      {
+                          "path":  ".claude/skills/test/SKILL.md",
+                          "sha256":  "c8dcdce430a2b3bd88f629da03e7803f7a66d9f9e30f095b0af1297a0fb1c777"
+                      }
+                  ],
+    "projectOwned":  [
+                         ".ai/README.md",
+                         ".ai/project.md",
+                         ".ai/architecture.md",
+                         ".ai/business-rules/README.md",
+                         ".ai/components/README.md",
+                         ".ai/database/README.md",
+                         ".ai/integrations/README.md",
+                         ".ai/legacy/README.md",
+                         ".ai/decisions/README.md",
+                         ".ai/tasks/README.md"
+                     ]
+}
