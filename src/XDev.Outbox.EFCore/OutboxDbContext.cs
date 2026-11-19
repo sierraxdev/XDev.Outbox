@@ -1144,10 +1144,8 @@ namespace XDev.Outbox.EFCore
             var sql = this.GetService<ISqlGenerationHelper>();
 
             // ExecuteSqlRaw formats the text with the parameter placeholders, so braces in identifiers are escaped.
-            return $"UPDATE {EscapeFormat(sql.DelimitIdentifier(table.Name, table.Schema))} SET {EscapeFormat(sql.DelimitIdentifier(payloadColumn))} = {{0}} WHERE {EscapeFormat(sql.DelimitIdentifier(idColumn))} = {{1}}";
+            return $"UPDATE {OutboxSqlText.EscapeFormat(sql.DelimitIdentifier(table.Name, table.Schema))} SET {OutboxSqlText.EscapeFormat(sql.DelimitIdentifier(payloadColumn))} = {{0}} WHERE {OutboxSqlText.EscapeFormat(sql.DelimitIdentifier(idColumn))} = {{1}}";
         }
-
-        private static string EscapeFormat(string text) => text.Replace("{", "{{").Replace("}", "}}");
 
         private ICollection<OutboxMessage<TKey>> ToOutboxMessageEntity(IReadOnlyList<object> events, TimeProvider timeProvider)
         {

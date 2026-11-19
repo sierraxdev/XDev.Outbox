@@ -137,7 +137,10 @@ Each rule is labeled:
 - [Confirmed] On success, the row is deleted. The table holds only pending or
   failed messages, and there is no processed history.
 - [Confirmed] On failure, `Attemps` is incremented, `IsError = true`, and
-  `ErrorMessage = exception.Message`. `LockExpiresAt` is not changed, so the
+  `ErrorMessage = exception.Message`. Since 2026-11-19 this is the
+  subscriber's own exception even when it throws synchronously (before, it
+  was the reflection wrapper text "Exception has been thrown by the target of
+  an invocation."). `LockExpiresAt` is not changed, so the
   retry happens on a later poll after the lock expires.
 - [Confirmed] Retry stops when `Attemps >= MaxAttemps`. `MaxAttemps` defaults
   to 15 when `OutboxConfiguration.MaxAttemps` is null. Rows past the limit stay

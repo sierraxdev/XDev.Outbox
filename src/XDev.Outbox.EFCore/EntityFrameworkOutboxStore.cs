@@ -62,9 +62,12 @@ namespace XDev.Outbox.EFCore
                 @params.Add(new SqlParameter("@take", itemsCount.Value));
             }
 
+            // FromSqlRaw formats the text with the parameter placeholders, so braces in the table name are escaped.
+            var table = OutboxSqlText.EscapeFormat(
+                OutboxSqlText.DelimitedTableName(_dbContext, _dbContext.Model.FindEntityType(typeof(OutboxMessage<TKey>))));
             queryBuilder.AppendLine($"""
                     *
-                    FROM {_dbContext.GetTableNameWithScheme<OutboxMessage<TKey>>()} WITH (ROWLOCK, READPAST, UPDLOCK)
+                    FROM {table} WITH (ROWLOCK, READPAST, UPDLOCK)
                 """);
             queryBuilder.AppendLine();
 
