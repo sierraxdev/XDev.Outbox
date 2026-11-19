@@ -238,11 +238,6 @@ namespace XDev.Outbox.EFCore
                     {
                         await using var transaction = await Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
                         var result = await RunAttemptAsync(attempt, acceptAllChangesOnSuccess, ct);
-                        var fail = true;
-                        if (fail)
-                        {
-                            throw new TimeoutException("Simulated transient failure");
-                        }
                         await transaction.CommitAsync(ct);
                         return result;
                     }
