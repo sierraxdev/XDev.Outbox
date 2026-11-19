@@ -10,4 +10,7 @@
     <Project Path="src/XDev.Outbox.ServiceBus/XDev.Outbox.ServiceBus.csproj" />
     <Project Path="src/XDev.Outbox/XDev.Outbox.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/XDev.Outbox.EFCore.Tests/XDev.Outbox.EFCore.Tests.csproj" />
+  </Folder>
 </Solution>

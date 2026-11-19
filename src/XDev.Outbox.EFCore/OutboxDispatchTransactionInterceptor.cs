@@ -1,23 +1,30 @@
 ﻿using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
-using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
-using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace XDev.Outbox.EFCore
-{/// <summary>
- /// Tells <see cref="TransactionalOutboxMessageQueue"/> how each EF Core transaction ended: on commit the outbox
- /// messages buffered for it go to the in-memory dispatcher; on rollback, or when the commit or rollback itself fails
- /// (the outcome is unknown, and a committed row is still found by the outbox poller), they are dropped.
- /// Failures of other actions (savepoints) do not end the transaction and are ignored.
- /// </summary>
+{
+    /// <summary>
+    /// Tells the <see cref="IMessageQueue{TKey}"/> how each caller-owned EF Core transaction ended: on commit the outbox
+    /// messages saved in it go to the in-memory dispatcher; on rollback, or when the commit or rollback itself fails
+    /// (the outcome is unknown, and a committed row is still found by the outbox poller), they are dropped. Their
+    /// buffered events stay buffered when they were saved with acceptAllChangesOnSuccess = false (the business changes
+    /// are still pending and will be saved again) and are removed otherwise.
+    /// Such an event stays buffered until it is saved again or its changes are accepted, also across later transactions
+    /// that end without saving it. A rollback to a savepoint drops the messages whose rows it undid, with the same
+    /// buffer rule. When the rows a rollback to a savepoint undid cannot be determined even just before the commit, the
+    /// commit proceeds, the affected messages are left to the outbox poller and a warning is logged under
+    /// <c>Microsoft.EntityFrameworkCore.Database.Transaction</c> with event id 41001
+    /// (<c>XDev.Outbox.EFCore.UnconfirmedPendingMessagesAtCommit</c>).
+    /// The buffer itself is updated by the context (<see cref="IOutboxTransactionParticipant{TKey}"/>) for every outcome.
+    /// Failures of other actions (savepoints) do not end the transaction and are ignored.
+    /// Transactions owned by <see cref="OutboxDbContext{TKey, TContext}"/> dispatch their own messages and are ignored here.
+    /// </summary>
     public sealed class OutboxDispatchTransactionInterceptor<TKey> : DbTransactionInterceptor where TKey : struct
     {
         private const string CommitAction = "Commit";
@@ -29,47 +36,49 @@ namespace XDev.Outbox.EFCore
         {
             _queue = queue ?? throw new ArgumentNullException(nameof(queue));
         }
-        
+
+        public override InterceptionResult TransactionCommitting(DbTransaction transaction, TransactionEventData eventData, InterceptionResult result)
+        {
+            if (eventData.Context is IOutboxTransactionParticipant<TKey> participant && !participant.IsOutboxSaveInProgress)
+            {
+                participant.TransactionCommitting(eventData.TransactionId);
+            }
+            return result;
+        }
+
+        public override async ValueTask<InterceptionResult> TransactionCommittingAsync(DbTransaction transaction, TransactionEventData eventData, InterceptionResult result, CancellationToken cancellationToken = default)
+        {
+            if (eventData.Context is IOutboxTransactionParticipant<TKey> participant && !participant.IsOutboxSaveInProgress)
+            {
+                await participant.TransactionCommittingAsync(eventData.TransactionId, cancellationToken);
+            }
+            return result;
+        }
+
         public override void TransactionCommitted(DbTransaction transaction, TransactionEndEventData eventData)
         {
-            var outbox = eventData.Context.GetService<IOutbox>();
-            var events = outbox?.GetEvents();
-            foreach (var item in eventData.Context.ChangeTracker.Entries<OutboxMessage<TKey>>()
-                .Where(x => x.State == EntityState.Unchanged)
-                .Select(x => x.Entity)
-                .Where(x => events == null || events.Any(e => e == x.Payload))
-                )
+            foreach (var item in TakeCommittedMessages(eventData))
             {
                 _queue.EnqueueAsync(item).GetAwaiter().GetResult();
             }
-            outbox?.ClearEvents();
         }
 
         public override async Task TransactionCommittedAsync(DbTransaction transaction, TransactionEndEventData eventData, CancellationToken cancellationToken = default)
         {
-            var outbox = eventData.Context.GetService<IOutbox>();
-            var events = outbox?.GetEvents();
-            foreach (var item in eventData.Context.ChangeTracker.Entries<OutboxMessage<TKey>>()
-                .Where(x => x.State == EntityState.Unchanged)
-                .Select(x => x.Entity)
-                .Where(x => events == null || events.Any(e => e == x.Payload))
-                )
+            foreach (var item in TakeCommittedMessages(eventData))
             {
                 await _queue.EnqueueAsync(item, cancellationToken);
             }
-            outbox?.ClearEvents();
         }
 
         public override void TransactionRolledBack(DbTransaction transaction, TransactionEndEventData eventData)
         {
-            var outbox = eventData.Context.GetService<IOutbox>();
-            outbox?.ClearEvents();
+            Discard(eventData.Context, eventData.TransactionId);
         }
 
         public override Task TransactionRolledBackAsync(DbTransaction transaction, TransactionEndEventData eventData, CancellationToken cancellationToken = default)
         {
-            var outbox = eventData.Context.GetService<IOutbox>();
-            outbox?.ClearEvents();
+            Discard(eventData.Context, eventData.TransactionId);
             return Task.CompletedTask;
         }
 
@@ -77,8 +86,7 @@ namespace XDev.Outbox.EFCore
         {
             if (EndsTransaction(eventData))
             {
-                var outbox = eventData.Context.GetService<IOutbox>();
-                outbox?.ClearEvents();
+                Discard(eventData.Context, eventData.TransactionId);
             }
         }
 
@@ -86,10 +94,56 @@ namespace XDev.Outbox.EFCore
         {
             if (EndsTransaction(eventData))
             {
-                var outbox = eventData.Context.GetService<IOutbox>();
-                outbox?.ClearEvents();
+                Discard(eventData.Context, eventData.TransactionId);
             }
             return Task.CompletedTask;
+        }
+
+        public override void RolledBackToSavepoint(DbTransaction transaction, TransactionEventData eventData)
+        {
+            if (eventData.Context is IOutboxTransactionParticipant<TKey> participant && !participant.IsOutboxSaveInProgress)
+            {
+                participant.RolledBackToSavepoint(eventData.TransactionId);
+            }
+        }
+
+        public override Task RolledBackToSavepointAsync(DbTransaction transaction, TransactionEventData eventData, CancellationToken cancellationToken = default)
+        {
+            if (eventData.Context is IOutboxTransactionParticipant<TKey> participant && !participant.IsOutboxSaveInProgress)
+            {
+                return participant.RolledBackToSavepointAsync(eventData.TransactionId, cancellationToken);
+            }
+            return Task.CompletedTask;
+        }
+
+        private static IReadOnlyList<OutboxMessage<TKey>> TakeCommittedMessages(TransactionEndEventData eventData)
+        {
+            var context = eventData.Context;
+            if (context == null) return Array.Empty<OutboxMessage<TKey>>();
+
+            if (context is IOutboxTransactionParticipant<TKey> participant)
+            {
+                return participant.IsOutboxSaveInProgress
+                    ? Array.Empty<OutboxMessage<TKey>>()
+                    : participant.TransactionCommitted(eventData.TransactionId);
+            }
+
+            context.GetService<IOutbox>().ClearEvents();
+            return Array.Empty<OutboxMessage<TKey>>();
+        }
+
+        private static void Discard(DbContext context, Guid transactionId)
+        {
+            if (context == null) return;
+
+            if (context is IOutboxTransactionParticipant<TKey> participant)
+            {
+                if (participant.IsOutboxSaveInProgress) return;
+                participant.EndTransactionWithoutCommit(transactionId);
+                return;
+            }
+
+            context.GetService<IOutbox>().ClearEvents();
         }
 
         private static bool EndsTransaction(TransactionErrorEventData eventData) =>

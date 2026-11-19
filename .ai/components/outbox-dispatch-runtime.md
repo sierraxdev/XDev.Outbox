@@ -81,12 +81,11 @@ with overloaded `HandleEventAsync` methods (commit 452857f).
   `StopAsync`.
 - **Misleading shutdown log.** Every normal shutdown logs "Error occurred
   getting messages from store" with an `OperationCanceledException`.
-- **Shared entity instance.** On the immediate path, the `OutboxMessage`
-  instance handed to the handler is still tracked by the committing request's
-  `DbContext`. The handler scope's `DbContext` attaches the same instance for
-  `Remove` or `Update`, and the hosted service mutates it from another thread.
-  A later save on the request context could then issue an unexpected UPDATE,
-  or fail with a concurrency error if the row was already deleted.
+- **Shared payload instance.** On the immediate path, with flag=true, the
+  handler receives the same event object the request created, including any
+  entity graph it references, while the request thread may still use it.
+  Since the 2026-11-18 fix, the `OutboxMessage` entity itself is detached from
+  the request's `DbContext` before it is queued.
 - **Dead path in `ObjectExtensions.ToObject`.** The nested `ExpandoObject`
   branch calls `GetMethod(nameof(ToObject))`, which is ambiguous across
   overloads. With System.Text.Json, nested values are `JsonElement`, so the

@@ -17,22 +17,39 @@ Each rule is labeled:
 
 - [Confirmed] Events are any CLR object passed to `IOutbox.AddEvent(params object[])`.
   `IOutbox` is scoped, so events belong to the DI scope that resolved it.
-- [Confirmed] Events are persisted only by
-  `OutboxDbContext.SaveChangesAsync(CancellationToken)`. The sync
-  `SaveChanges()` and `SaveChangesAsync(bool, CancellationToken)` are not
-  overridden and do not write buffered events.
-- [Confirmed] Business changes are saved first and the outbox rows second,
-  inside the same transaction. If an event *references* a business entity
-  object, as the sample's `UserCreatedEvent.User` does, that entity's
-  store-generated key is populated before the payload is serialized. A key
-  value copied into the event at `AddEvent` time is still the default.
-- [Confirmed] `SaveChangesAsync` on any `OutboxDbContext` resolves `IOutbox`
-  and `IMessageQueue<TKey>` through EF's `GetService<T>()`, which throws when a
+- [Confirmed] **All four** public save overloads persist buffered events
+  atomically with the business changes: `SaveChanges()`, `SaveChanges(bool)`,
+  `SaveChangesAsync(ct)`, and `SaveChangesAsync(bool, ct)`. Events are
+  dispatched only after commit. (Before the 2026-11-18 fix, only
+  `SaveChangesAsync(ct)` did this.)
+- [Confirmed] Change acceptance is deferred until after the library-owned
+  commit, and the caller's `acceptAllChangesOnSuccess` is honored. A failed
+  save leaves the tracker as plain EF would:
+  - business entries stay pending;
+  - no outbox entities stay tracked;
+  - the event buffer is kept.
+  A retry then persists everything exactly once.
+- [Confirmed] Rule A: if an event *references* a business entity object, as
+  the sample's `UserCreatedEvent.User` does, the persisted payload contains
+  that entity's store-generated keys and FKs. This holds for both flag values.
+  A key value copied into the event at `AddEvent` time is still the default.
+  See `components/efcore-outbox-store.md` for the mechanism.
+- [Confirmed] Every save on an `OutboxDbContext` resolves `IOutbox` and
+  `IMessageQueue<TKey>` through EF's `GetService<T>()`, which throws when a
   service is missing. `AddOutbox` must therefore be registered, even for saves
-  with no buffered events. (The `IMessageQueue` it resolves is no longer used.)
-- [Confirmed] After a commit, the buffer is cleared. After a rollback or a
-  failed commit or rollback, the buffer is cleared without dispatch
-  (`OutboxDispatchTransactionInterceptor`).
+  with no buffered events.
+- [Confirmed] Library-owned save: after commit, the buffer is cleared and
+  messages are enqueued. After a failure, the buffer is kept.
+- [Confirmed] Caller-owned transaction:
+  - On commit, committed and never-saved events are removed from the buffer.
+  - If the transaction ends without commit (rollback, failed commit, or
+    dispose), the events follow their business changes:
+    - saved with `acceptAllChangesOnSuccess=false`: the events stay buffered;
+    - saved with `true`: the events are dropped.
+  - Rows undone by `RollbackToSavepoint` are not dispatched.
+  - Details are in `components/efcore-outbox-store.md`.
+- [Confirmed] Outbox entities are not left tracked by the DbContext after a
+  save.
 - [Confirmed] Each persisted row stores `Type = event.GetType().AssemblyQualifiedName`
   and `Payload` = the event serialized as JSON with
   `OutboxConfiguration.SerializerOptions`: camelCase, enums as strings, nulls
@@ -104,9 +121,15 @@ Each rule is labeled:
 
 ## Payload Received by Subscribers
 
-- [Confirmed] **Immediate dispatch** passes the **original in-memory event
-  instance** to the subscriber. This is the same object the application
-  passed to `AddEvent`, including any EF entity graphs it references.
+- [Confirmed] **Immediate dispatch** after a save with
+  `acceptAllChangesOnSuccess=true`, which is the default, passes the **original
+  in-memory event instance** to the subscriber. This is the same object the
+  application passed to `AddEvent`, including any EF entity graphs it
+  references.
+- [Confirmed] **Immediate dispatch** after a save with
+  `acceptAllChangesOnSuccess=false` passes an `ExpandoObject` rebuilt from the
+  persisted JSON (decision D3). It goes through the same conversion as the
+  poller path, so the poller-path rules below apply.
 - [Confirmed] **Poller dispatch** passes a new instance rebuilt from JSON. The
   instance is created with `Activator.CreateInstance` and its public writable
   properties are populated (`ObjectExtensions.ToObject`). Init-only setters

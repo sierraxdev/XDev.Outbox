@@ -5,10 +5,12 @@
 The system is an in-process transactional outbox:
 
 1. Application code buffers events in the scoped `IOutbox`.
-2. `OutboxDbContext<TKey>.SaveChangesAsync` writes business changes and outbox
-   rows in one database transaction.
-3. On transaction commit, an EF Core transaction interceptor enqueues the just-
-   written messages to a singleton in-memory queue (immediate dispatch).
+2. Any `OutboxDbContext<TKey>` save overload writes business changes and
+   outbox rows in one database transaction.
+3. After commit, the just-written messages are enqueued to a singleton
+   in-memory queue (immediate dispatch). For library-owned transactions the
+   save method does this itself. For caller-owned transactions an EF Core
+   transaction interceptor does it.
 4. A singleton hosted service consumes the queue, resolves subscribers in a new
    DI scope, invokes them, then deletes the row (success) or records the
    failure (failure).
@@ -52,20 +54,24 @@ Component details are in `components/outbox-dispatch-runtime.md` and
 
 ### Write flow (application request)
 
-`IOutbox.AddEvent(evt)` adds to the buffer. Then
-`OutboxDbContext.SaveChangesAsync()` runs:
+`IOutbox.AddEvent(evt)` adds to the buffer. Then any save overload runs. The
+logic lives in `SaveChanges(bool)` and `SaveChangesAsync(bool, ct)`:
 
-- If there are no buffered events, it calls the base `SaveChangesAsync`.
-- If there is no ambient transaction, it runs inside the configured execution
-  strategy. It begins a `ReadCommitted` transaction, saves the business
-  changes, adds the `OutboxMessage` entities, saves again, and commits.
-- If there is an ambient transaction, it saves, adds the outbox messages, and
-  saves again. The caller commits.
+- **No buffered events:** it passes through to the base save.
+- **No ambient transaction:** it runs inside the execution strategy and a
+  `ReadCommitted` transaction:
+  1. A single `SaveChanges(false)` writes the business rows and the outbox
+     rows.
+  2. Payloads are patched with generated keys.
+  3. It commits.
+  4. It accepts changes, if the flag is true.
+  5. It clears the buffer and enqueues the messages.
+- **Ambient transaction:** it runs the same save and patch, then records the
+  messages as pending. The interceptor dispatches them when the caller
+  commits. If the transaction ends without a commit, the events follow their
+  business changes (B1).
 
-The commit triggers `OutboxDispatchTransactionInterceptor.TransactionCommitted`,
-which enqueues the matching tracked messages to `IMessageQueue` and clears the
-buffer. A rollback, or a failed commit or rollback, clears the buffer without
-enqueueing.
+Details are in `components/efcore-outbox-store.md`.
 
 ### Immediate dispatch flow
 
@@ -138,7 +144,12 @@ and is not registered. See `integrations/azure-service-bus.md`.
 These items materially affect future work. Business intent for each is
 unknown unless stated.
 
-- No automated tests exist. Behavior is verified only by running the sample.
+- Automated tests cover only the EF Core save and dispatch path
+  (`tests/XDev.Outbox.EFCore.Tests`, SQLite). The core runtime, the
+  SQL Server claim query, and the hosted service have no tests.
+- The save path is a large state machine (about 1,100 lines) that depends on
+  undocumented EF change-tracker internals. See
+  `decisions/001-deferred-acceptance-and-payload-projection.md`.
 - `OutboxInterceptor<TKey>` (a `SaveChangesInterceptor`) is registered as a DI
   singleton but is never added to any DbContext. It appears superseded by the
   `OutboxDbContext` save override plus `OutboxDispatchTransactionInterceptor`.

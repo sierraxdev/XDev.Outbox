@@ -1,12 +1,19 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
+using System.Linq.Expressions;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -19,8 +26,52 @@ namespace XDev.Outbox.EFCore
         {
         }
     }
-    public abstract class OutboxDbContext<TKey, TContext> : DbContext where TKey : struct where TContext : DbContext, IOutboxDbContext<TKey>
+
+    // State machine for events saved inside a caller-owned transaction (owned saves commit and dispatch in one step).
+    //
+    // A save with events inside a caller transaction records one pending message per event (_pendingOutboxMessages,
+    // tied to _pendingTransactionId); its event stays in the IOutbox buffer and is not saved again in that transaction.
+    // Pending message states:
+    //   - not accepted: saved with acceptAllChangesOnSuccess = false; its business changes are still pending in the tracker.
+    //   - accepted: saved with acceptAllChangesOnSuccess = true, or any later flag = true save in the transaction
+    //     (with or without events) accepted every tracked change.
+    //   - unconfirmed (orthogonal): the existence check after a rollback to a savepoint failed; never dispatched in
+    //     memory until a later check (next save, next savepoint rollback, committing) confirms or releases it.
+    // Transitions and buffer rule:
+    //   - savepoint rollback / successful check: rows that no longer exist are released (below); existing rows confirmed.
+    //   - committing: unconfirmed messages are checked again; if that fails, a warning (UnconfirmedAtCommitEventId) is logged.
+    //   - committed: confirmed messages are dispatched; their events and never-saved events leave the buffer.
+    //   - ended without commit (rollback, failed commit/rollback) and stale (another transaction is current or
+    //     committed, i.e. the earlier one was disposed): every pending message is released.
+    //   - released: no dispatch. Accepted -> its event leaves the buffer (the changes will not be saved again).
+    //     Not accepted -> its event stays buffered and is recorded in _releasedNotAcceptedEvents.
+    // _releasedNotAcceptedEvents (by reference and multiplicity) keeps those events distinguishable from never-saved
+    // events, so a later end of another transaction without a save does not drop them (never-saved events are dropped
+    // on commit/rollback). An entry leaves the list when its event is saved again (pending again, or persisted by an
+    // owned save), when a flag = true save accepts the business changes, or when the event is no longer in the buffer.
+    public abstract class OutboxDbContext<TKey, TContext> : DbContext, IOutboxTransactionParticipant<TKey> where TKey : struct where TContext : DbContext, IOutboxDbContext<TKey>
     {
+        // Upper bound of ids per existence query after a rollback to a savepoint (keeps parameter counts low).
+        private const int ExistenceQueryBatchSize = 100;
+
+        /// <summary>
+        /// Event id of the warning logged (category <c>Microsoft.EntityFrameworkCore.Database.Transaction</c>) when,
+        /// just before a caller transaction commits, the existence of pending outbox rows cannot be confirmed after a
+        /// failed check following a rollback to a savepoint: id 41001, name
+        /// <c>XDev.Outbox.EFCore.UnconfirmedPendingMessagesAtCommit</c>. The commit proceeds; those messages are not
+        /// dispatched in memory and committed rows are delivered by the outbox poller.
+        /// </summary>
+        private static readonly EventId UnconfirmedAtCommitEventId = new EventId(41001, "XDev.Outbox.EFCore.UnconfirmedPendingMessagesAtCommit");
+
+        // Messages saved inside a caller-owned transaction; dispatched by the interceptor when that transaction commits.
+        private readonly List<SavedOutboxMessage> _pendingOutboxMessages = new List<SavedOutboxMessage>();
+        private Guid? _pendingTransactionId;
+        // Buffered events of released, not accepted messages (see the state machine above); by reference, with duplicates.
+        private readonly List<object> _releasedNotAcceptedEvents = new List<object>();
+        private bool _outboxSaveInProgress;
+        // > 0 while one of the SaveChanges overrides runs; savepoints EF creates and rolls back inside a save are ignored.
+        private int _saveDepth;
+
         public DbSet<OutboxMessage<TKey>> OutboxMessages { get; set; }
 
         public OutboxDbContext(DbContextOptions options)
@@ -45,94 +96,1013 @@ namespace XDev.Outbox.EFCore
             base.OnConfiguring(optionsBuilder);
         }
 
-        public override async Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+        public override int SaveChanges(bool acceptAllChangesOnSuccess)
         {
-            var result = default(int);
+            _saveDepth++;
+            try
+            {
+                return SaveChangesCore(acceptAllChangesOnSuccess);
+            }
+            finally
+            {
+                _saveDepth--;
+            }
+        }
 
+        public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
+        {
+            _saveDepth++;
+            try
+            {
+                return await SaveChangesCoreAsync(acceptAllChangesOnSuccess, cancellationToken);
+            }
+            finally
+            {
+                _saveDepth--;
+            }
+        }
+
+        private int SaveChangesCore(bool acceptAllChangesOnSuccess)
+        {
             var outbox = this.GetService<IOutbox>();
             var messageQueue = this.GetService<IMessageQueue<TKey>>();
             var timeProvider = this.GetService<TimeProvider>();
-            var outboxMessages = ToOutboxMessageEntity(outbox, timeProvider);
 
-            if (outboxMessages.Any())
+            if (HasUnconfirmedPendingMessages(Database.CurrentTransaction?.TransactionId))
             {
-                var hasExistingTransaction = Database.CurrentTransaction != null;
-                if (!hasExistingTransaction)
+                ResolvePendingMessages(QueryExistingPendingIds());
+            }
+
+            var events = GetEventsToSave(outbox);
+            if (events.Count == 0)
+            {
+                var plainResult = base.SaveChanges(acceptAllChangesOnSuccess);
+                if (acceptAllChangesOnSuccess) MarkPendingChangesAccepted();
+                return plainResult;
+            }
+
+            if (Database.CurrentTransaction != null)
+            {
+                var ambientAttempt = BeginAttempt(events, timeProvider);
+                OutboxSaveResult ambient;
+                try
                 {
-                    var entityStateSnapshot = ChangeTracker.Entries().Where(x => x.State == EntityState.Added || x.State == EntityState.Deleted || x.State == EntityState.Modified).Select(Entry => (Entry, Entry.State )).ToArray();
-                    var attempt = 0;
-                    var executionStrategy = Database.CreateExecutionStrategy();
-                    result = await executionStrategy.ExecuteAsync(async () =>
+                    ambient = RunAttempt(ambientAttempt, acceptAllChangesOnSuccess);
+                }
+                catch (Exception ex)
+                {
+                    RecoverFailedAttempt(ambientAttempt, ex);
+                    throw;
+                }
+                return CompleteAmbientSave(ambient, acceptAllChangesOnSuccess);
+            }
+
+            OutboxSaveResult saved;
+            _outboxSaveInProgress = true;
+            try
+            {
+                saved = Database.CreateExecutionStrategy().Execute(() =>
+                {
+                    var attempt = BeginAttempt(events, timeProvider);
+                    try
                     {
-                        await using var transaction = await Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
-
-                        attempt++; 
-                        if (attempt > 1)
-                        {
-                            foreach (var item in entityStateSnapshot)
-                            {
-                                item.Entry.State = item.State;
-                                if(item.Entry.State == EntityState.Added)
-                                {
-                                    var property = item.Entry.Properties.FirstOrDefault(p => p.Metadata.IsPrimaryKey());
-                                    if (property != null && property.Metadata.ValueGenerated == ValueGenerated.OnAdd)
-                                    {
-                                        property.CurrentValue = GetDefaultValue<TKey>();
-                                    }
-                                }
-                            }
-                            foreach (var item in ChangeTracker.Entries<OutboxMessage<TKey>>()
-                                .Where(x => !outboxMessages.Any(m => m.Payload == x.Entity)))
-                            {
-                                item.State = EntityState.Detached;
-                            }
-                        }
-
-                        var result = await base.SaveChangesAsync(cancellationToken);
-
-                        var addedCount = AddOutboxMessages(outboxMessages);
-
-                        if(addedCount > 0)
-                        {
-                            Database.AutoTransactionBehavior = AutoTransactionBehavior.Never;
-                            await base.SaveChangesAsync(cancellationToken);
-                        }
-
-                        await transaction.CommitAsync(cancellationToken);
-
+                        using var transaction = Database.BeginTransaction(IsolationLevel.ReadCommitted);
+                        var result = RunAttempt(attempt, acceptAllChangesOnSuccess);
+                        transaction.Commit();
                         return result;
-                    });
+                    }
+                    catch (Exception ex)
+                    {
+                        RecoverFailedAttempt(attempt, ex);
+                        throw;
+                    }
+                });
+            }
+            finally
+            {
+                _outboxSaveInProgress = false;
+            }
+
+            CompleteOwnedSave(outbox, acceptAllChangesOnSuccess);
+            foreach (var item in saved.Messages)
+            {
+                messageQueue.EnqueueAsync(item.Message).GetAwaiter().GetResult();
+            }
+
+            return saved.Result;
+        }
+
+        private async Task<int> SaveChangesCoreAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken)
+        {
+            var outbox = this.GetService<IOutbox>();
+            var messageQueue = this.GetService<IMessageQueue<TKey>>();
+            var timeProvider = this.GetService<TimeProvider>();
+
+            if (HasUnconfirmedPendingMessages(Database.CurrentTransaction?.TransactionId))
+            {
+                ResolvePendingMessages(await QueryExistingPendingIdsAsync(cancellationToken));
+            }
+
+            var events = GetEventsToSave(outbox);
+            if (events.Count == 0)
+            {
+                var plainResult = await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+                if (acceptAllChangesOnSuccess) MarkPendingChangesAccepted();
+                return plainResult;
+            }
+
+            if (Database.CurrentTransaction != null)
+            {
+                var ambientAttempt = BeginAttempt(events, timeProvider);
+                OutboxSaveResult ambient;
+                try
+                {
+                    ambient = await RunAttemptAsync(ambientAttempt, acceptAllChangesOnSuccess, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    RecoverFailedAttempt(ambientAttempt, ex);
+                    throw;
+                }
+                return CompleteAmbientSave(ambient, acceptAllChangesOnSuccess);
+            }
+
+            OutboxSaveResult saved;
+            _outboxSaveInProgress = true;
+            try
+            {
+                saved = await Database.CreateExecutionStrategy().ExecuteAsync(async ct =>
+                {
+                    var attempt = BeginAttempt(events, timeProvider);
+                    try
+                    {
+                        await using var transaction = await Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+                        var result = await RunAttemptAsync(attempt, acceptAllChangesOnSuccess, ct);
+                        var fail = true;
+                        if (fail)
+                        {
+                            throw new TimeoutException("Simulated transient failure");
+                        }
+                        await transaction.CommitAsync(ct);
+                        return result;
+                    }
+                    catch (Exception ex)
+                    {
+                        RecoverFailedAttempt(attempt, ex);
+                        throw;
+                    }
+                }, cancellationToken);
+            }
+            finally
+            {
+                _outboxSaveInProgress = false;
+            }
+
+            CompleteOwnedSave(outbox, acceptAllChangesOnSuccess);
+            foreach (var item in saved.Messages)
+            {
+                await messageQueue.EnqueueAsync(item.Message, cancellationToken);
+            }
+
+            return saved.Result;
+        }
+
+        bool IOutboxTransactionParticipant<TKey>.IsOutboxSaveInProgress => _outboxSaveInProgress;
+
+        void IOutboxTransactionParticipant<TKey>.TransactionCommitting(Guid transactionId)
+        {
+            if (!HasUnconfirmedPendingMessages(transactionId)) return;
+
+            HashSet<TKey> existing;
+            try
+            {
+                existing = QueryExistingPendingIds();
+            }
+            catch (Exception ex) when (!(ex is OperationCanceledException))
+            {
+                LogUnconfirmedPendingMessages(ex);
+                return;
+            }
+            ResolvePendingMessages(existing);
+        }
+
+        async Task IOutboxTransactionParticipant<TKey>.TransactionCommittingAsync(Guid transactionId, CancellationToken cancellationToken)
+        {
+            if (!HasUnconfirmedPendingMessages(transactionId)) return;
+
+            HashSet<TKey> existing;
+            try
+            {
+                existing = await QueryExistingPendingIdsAsync(cancellationToken);
+            }
+            catch (Exception ex) when (!(ex is OperationCanceledException))
+            {
+                LogUnconfirmedPendingMessages(ex);
+                return;
+            }
+            ResolvePendingMessages(existing);
+        }
+
+        IReadOnlyList<OutboxMessage<TKey>> IOutboxTransactionParticipant<TKey>.TransactionCommitted(Guid transactionId)
+        {
+            var isCurrent = _pendingTransactionId == transactionId;
+            var committed = isCurrent ? _pendingOutboxMessages.ToList() : new List<SavedOutboxMessage>();
+            // Only one transaction can be current per context, so messages pending for another id belong to a
+            // transaction that ended without a commit (disposed); they follow the rule for an uncommitted end.
+            var stale = isCurrent ? new List<SavedOutboxMessage>() : _pendingOutboxMessages.ToList();
+
+            UpdateBuffer(released: stale, committed: committed, keepUnsavedEvents: false);
+            _pendingOutboxMessages.Clear();
+            _pendingTransactionId = null;
+
+            // Unconfirmed messages are not dispatched in memory: if their row committed, the outbox poller delivers it.
+            return committed.Where(x => !x.Unconfirmed).Select(x => x.Message).ToList();
+        }
+
+        void IOutboxTransactionParticipant<TKey>.EndTransactionWithoutCommit(Guid transactionId)
+        {
+            // Only one transaction can be current per context, so anything pending for another id has ended too.
+            ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList(), keepUnsavedEvents: false);
+        }
+
+        void IOutboxTransactionParticipant<TKey>.RolledBackToSavepoint(Guid transactionId)
+        {
+            if (!ShouldCheckSavepointRollback(transactionId)) return;
+
+            HashSet<TKey> existing;
+            try
+            {
+                existing = QueryExistingPendingIds();
+            }
+            catch
+            {
+                MarkPendingMessagesUnconfirmed();
+                throw;
+            }
+            ResolvePendingMessages(existing);
+        }
+
+        async Task IOutboxTransactionParticipant<TKey>.RolledBackToSavepointAsync(Guid transactionId, CancellationToken cancellationToken)
+        {
+            if (!ShouldCheckSavepointRollback(transactionId)) return;
+
+            HashSet<TKey> existing;
+            try
+            {
+                existing = await QueryExistingPendingIdsAsync(cancellationToken);
+            }
+            catch
+            {
+                MarkPendingMessagesUnconfirmed();
+                throw;
+            }
+            ResolvePendingMessages(existing);
+        }
+
+        private bool ShouldCheckSavepointRollback(Guid transactionId)
+        {
+            // Savepoints EF creates inside a save never cover messages saved by an earlier save.
+            return _saveDepth == 0 && _pendingTransactionId == transactionId && _pendingOutboxMessages.Count > 0;
+        }
+
+        private bool HasUnconfirmedPendingMessages(Guid? transactionId)
+        {
+            return transactionId != null && _pendingTransactionId == transactionId && _pendingOutboxMessages.Any(x => x.Unconfirmed);
+        }
+
+        /// <summary>
+        /// The check after a rollback to a savepoint failed, so it is unknown which pending rows the rollback undid.
+        /// The messages stay pending (their events are not saved again in this transaction) but are not dispatched in
+        /// memory until a later check inside the transaction (next save, next rollback to a savepoint, or just before
+        /// commit) confirms them.
+        /// </summary>
+        private void MarkPendingMessagesUnconfirmed()
+        {
+            foreach (var message in _pendingOutboxMessages)
+            {
+                message.Unconfirmed = true;
+            }
+        }
+
+        /// <summary>A save with acceptAllChangesOnSuccess = true accepted every tracked change, including those of earlier saves.</summary>
+        private void MarkPendingChangesAccepted()
+        {
+            foreach (var message in _pendingOutboxMessages)
+            {
+                message.AcceptedChanges = true;
+            }
+            // Changes of released, not accepted messages are accepted too: their events must not be saved later.
+            _releasedNotAcceptedEvents.Clear();
+        }
+
+        private void LogUnconfirmedPendingMessages(Exception exception)
+        {
+            // The commit is not blocked: committed rows of unconfirmed messages are delivered by the outbox poller.
+            var logger = this.GetService<IDiagnosticsLogger<DbLoggerCategory.Database.Transaction>>();
+            logger?.Logger.LogWarning(
+                UnconfirmedAtCommitEventId,
+                exception,
+                "Could not confirm {Count} pending outbox message(s) before commit; they are not dispatched in memory and are delivered by the outbox poller if committed.",
+                _pendingOutboxMessages.Count(x => x.Unconfirmed));
+        }
+
+        private HashSet<TKey> QueryExistingPendingIds()
+        {
+            var existing = new HashSet<TKey>();
+            foreach (var query in ExistingOutboxIdQueries())
+            {
+                existing.UnionWith(query.ToList());
+            }
+            return existing;
+        }
+
+        private async Task<HashSet<TKey>> QueryExistingPendingIdsAsync(CancellationToken cancellationToken)
+        {
+            var existing = new HashSet<TKey>();
+            foreach (var query in ExistingOutboxIdQueries())
+            {
+                existing.UnionWith(await query.ToListAsync(cancellationToken));
+            }
+            return existing;
+        }
+
+        /// <summary>
+        /// EF reports savepoint operations without the savepoint name, so the rows that a rollback to a savepoint
+        /// undid are found by checking, inside the transaction, which pending outbox rows still exist.
+        /// </summary>
+        private IEnumerable<IQueryable<TKey>> ExistingOutboxIdQueries()
+        {
+            var ids = _pendingOutboxMessages.Select(x => x.Message.Id).Distinct().ToList();
+            for (var offset = 0; offset < ids.Count; offset += ExistenceQueryBatchSize)
+            {
+                var message = Expression.Parameter(typeof(OutboxMessage<TKey>), "m");
+                var idMember = Expression.Property(message, nameof(OutboxMessage<TKey>.Id));
+                Expression predicate = null;
+                foreach (var id in ids.Skip(offset).Take(ExistenceQueryBatchSize))
+                {
+                    // A member access on a closure-like holder makes EF send the id as a parameter.
+                    var value = Expression.Property(Expression.Constant(new IdHolder(id)), nameof(IdHolder.Value));
+                    var equal = IdEquals(idMember, value);
+                    predicate = predicate == null ? equal : Expression.OrElse(predicate, equal);
+                }
+
+                yield return Set<OutboxMessage<TKey>>()
+                    .IgnoreQueryFilters()
+                    .AsNoTracking()
+                    .Where(Expression.Lambda<Func<OutboxMessage<TKey>, bool>>(predicate, message))
+                    .Select(x => x.Id);
+            }
+        }
+
+        /// <summary>
+        /// <c>==</c> for key types that define it (primitives, enums, Guid, ...); otherwise the typed or
+        /// <see cref="object.Equals(object)"/> method, which EF also translates to an equality comparison.
+        /// </summary>
+        private static Expression IdEquals(Expression left, Expression right)
+        {
+            var type = typeof(TKey);
+            if (type.IsPrimitive || type.IsEnum || type.GetMethod("op_Equality", new[] { type, type }) != null)
+            {
+                return Expression.Equal(left, right);
+            }
+
+            var typedEquals = type.GetMethod(nameof(Equals), new[] { type });
+            return typedEquals != null
+                ? Expression.Call(left, typedEquals, right)
+                : Expression.Call(
+                    Expression.Convert(left, typeof(object)),
+                    typeof(object).GetMethod(nameof(Equals), new[] { typeof(object) }),
+                    Expression.Convert(right, typeof(object)));
+        }
+
+        /// <summary>
+        /// Applies an existence check made inside the transaction: messages whose row no longer exists were undone by
+        /// a rollback to a savepoint and are released; the others are confirmed (an undone row never comes back, so a
+        /// row that exists now was not undone by an earlier rollback).
+        /// </summary>
+        private void ResolvePendingMessages(HashSet<TKey> existingIds)
+        {
+            var rolledBack = new List<SavedOutboxMessage>();
+            foreach (var message in _pendingOutboxMessages)
+            {
+                if (existingIds.Contains(message.Message.Id))
+                {
+                    message.Unconfirmed = false;
                 }
                 else
                 {
-                    result = await base.SaveChangesAsync(cancellationToken);
+                    rolledBack.Add(message);
+                }
+            }
 
-                    var addedCount = AddOutboxMessages(outboxMessages);
-                    if (addedCount > 0)
+            if (rolledBack.Count > 0)
+            {
+                ReleasePendingOutboxMessages(rolledBack, keepUnsavedEvents: true);
+            }
+        }
+
+        /// <summary>
+        /// Forgets pending messages whose rows will never be committed, without dispatching them, and updates the
+        /// buffer as described in <see cref="UpdateBuffer"/>.
+        /// </summary>
+        private void ReleasePendingOutboxMessages(IReadOnlyList<SavedOutboxMessage> released, bool keepUnsavedEvents)
+        {
+            UpdateBuffer(released, Array.Empty<SavedOutboxMessage>(), keepUnsavedEvents);
+
+            foreach (var message in released)
+            {
+                _pendingOutboxMessages.Remove(message);
+            }
+            if (_pendingOutboxMessages.Count == 0)
+            {
+                _pendingTransactionId = null;
+            }
+        }
+
+        /// <summary>
+        /// Rebuilds the <see cref="IOutbox"/> buffer, order preserved; events are matched to messages by reference and
+        /// multiplicity. Events of <paramref name="released"/> messages (rows that will never be committed) follow the
+        /// business changes they were saved with: when those changes are still pending in the tracker (saved with
+        /// acceptAllChangesOnSuccess = false and not accepted by a later save) the event stays buffered and is saved
+        /// again with them; when they were accepted they will not be saved again, so the event is removed.
+        /// Events of <paramref name="committed"/> messages are removed. Events of the other pending messages are kept
+        /// (their transaction decides). Events kept earlier for released, not accepted messages
+        /// (<c>_releasedNotAcceptedEvents</c>) are kept. Other events (never saved) are kept only when
+        /// <paramref name="keepUnsavedEvents"/> is true. <c>_releasedNotAcceptedEvents</c> is rebuilt from the
+        /// buffer, so entries whose event the application removed from the buffer are forgotten.
+        /// </summary>
+        private void UpdateBuffer(IReadOnlyList<SavedOutboxMessage> released, IReadOnlyList<SavedOutboxMessage> committed, bool keepUnsavedEvents)
+        {
+            var outbox = this.GetService<IOutbox>();
+            var buffered = outbox.GetEvents()?.ToList() ?? new List<object>();
+            var unmatchedReleased = released.ToList();
+            var unmatchedCommitted = committed.ToList();
+            var unmatchedRemaining = _pendingOutboxMessages.Except(released).Except(committed).ToList();
+            var unmatchedReleasedNotAccepted = _releasedNotAcceptedEvents.ToList();
+            var releasedNotAccepted = new List<object>();
+
+            var keep = new List<object>(buffered.Count);
+            foreach (var @event in buffered)
+            {
+                var index = unmatchedReleased.FindIndex(x => ReferenceEquals(x.Event, @event));
+                if (index >= 0)
+                {
+                    var message = unmatchedReleased[index];
+                    unmatchedReleased.RemoveAt(index);
+                    if (!message.AcceptedChanges)
                     {
-                        Database.AutoTransactionBehavior = AutoTransactionBehavior.Never;
-                        await base.SaveChangesAsync(cancellationToken);
+                        keep.Add(@event);
+                        releasedNotAccepted.Add(@event);
+                    }
+                    continue;
+                }
+
+                index = unmatchedCommitted.FindIndex(x => ReferenceEquals(x.Event, @event));
+                if (index >= 0)
+                {
+                    unmatchedCommitted.RemoveAt(index);
+                    continue;
+                }
+
+                index = unmatchedRemaining.FindIndex(x => ReferenceEquals(x.Event, @event));
+                if (index >= 0)
+                {
+                    // Still saved in the current transaction; the commit or rollback decides.
+                    unmatchedRemaining.RemoveAt(index);
+                    keep.Add(@event);
+                    continue;
+                }
+
+                index = unmatchedReleasedNotAccepted.FindIndex(x => ReferenceEquals(x, @event));
+                if (index >= 0)
+                {
+                    // Released earlier with its business changes still pending: saved again with them later.
+                    unmatchedReleasedNotAccepted.RemoveAt(index);
+                    keep.Add(@event);
+                    releasedNotAccepted.Add(@event);
+                    continue;
+                }
+
+                if (keepUnsavedEvents) keep.Add(@event);
+            }
+
+            _releasedNotAcceptedEvents.Clear();
+            _releasedNotAcceptedEvents.AddRange(releasedNotAccepted);
+
+            if (keep.Count != buffered.Count)
+            {
+                outbox.ClearEvents();
+                if (keep.Count > 0)
+                {
+                    outbox.AddEvent(keep.ToArray());
+                }
+            }
+        }
+
+        /// <summary>
+        /// Buffered events that still need an outbox row: pending messages of a transaction that is no longer current
+        /// (disposed without commit or rollback) are released, and events already saved in the current transaction
+        /// are skipped.
+        /// </summary>
+        private IReadOnlyList<object> GetEventsToSave(IOutbox outbox)
+        {
+            if (_pendingTransactionId != null && _pendingTransactionId != Database.CurrentTransaction?.TransactionId)
+            {
+                ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList(), keepUnsavedEvents: true);
+            }
+
+            var events = outbox.GetEvents();
+            ForgetReleasedEventsNotBuffered(events);
+            if (events?.Any() != true) return Array.Empty<object>();
+
+            var pending = _pendingOutboxMessages.ToList();
+            var toSave = new List<object>();
+            foreach (var @event in events)
+            {
+                var index = pending.FindIndex(p => ReferenceEquals(p.Event, @event));
+                if (index >= 0)
+                {
+                    pending.RemoveAt(index);
+                    continue;
+                }
+                toSave.Add(@event);
+            }
+            return toSave;
+        }
+
+        /// <summary>
+        /// Entries of <c>_releasedNotAcceptedEvents</c> whose event the application removed from the buffer (for
+        /// example with <see cref="IOutbox.ClearEvents"/>) are forgotten, matched by reference and multiplicity, so
+        /// re-adding the same instance later does not resurrect them.
+        /// </summary>
+        private void ForgetReleasedEventsNotBuffered(IEnumerable<object> buffered)
+        {
+            if (_releasedNotAcceptedEvents.Count == 0) return;
+
+            var remaining = buffered?.ToList() ?? new List<object>();
+            var stillBuffered = new List<object>(_releasedNotAcceptedEvents.Count);
+            foreach (var @event in _releasedNotAcceptedEvents)
+            {
+                var index = remaining.FindIndex(x => ReferenceEquals(x, @event));
+                if (index < 0) continue;
+                remaining.RemoveAt(index);
+                stillBuffered.Add(@event);
+            }
+            _releasedNotAcceptedEvents.Clear();
+            _releasedNotAcceptedEvents.AddRange(stillBuffered);
+        }
+
+        private int CompleteAmbientSave(OutboxSaveResult saved, bool acceptAllChangesOnSuccess)
+        {
+            var transactionId = Database.CurrentTransaction.TransactionId;
+            if (_pendingTransactionId != transactionId)
+            {
+                // First save with events in this transaction: _pendingTransactionId is null here, because
+                // GetEventsToSave already released anything pending for another transaction (so Clear is a no-op).
+                _pendingOutboxMessages.Clear();
+                _pendingTransactionId = transactionId;
+            }
+            _pendingOutboxMessages.AddRange(saved.Messages);
+
+            // Events saved again are pending again (tracked by their new message), no longer released.
+            foreach (var message in saved.Messages)
+            {
+                var index = _releasedNotAcceptedEvents.FindIndex(x => ReferenceEquals(x, message.Event));
+                if (index >= 0) _releasedNotAcceptedEvents.RemoveAt(index);
+            }
+
+            if (acceptAllChangesOnSuccess)
+            {
+                ChangeTracker.AcceptAllChanges();
+                MarkPendingChangesAccepted();
+            }
+
+            return saved.Result;
+        }
+
+        private void CompleteOwnedSave(IOutbox outbox, bool acceptAllChangesOnSuccess)
+        {
+            if (acceptAllChangesOnSuccess)
+            {
+                ChangeTracker.AcceptAllChanges();
+            }
+            outbox.ClearEvents();
+            // Every buffered event, including released ones, was persisted and committed by this save.
+            _releasedNotAcceptedEvents.Clear();
+        }
+
+        private SaveAttempt BeginAttempt(IReadOnlyList<object> events, TimeProvider timeProvider)
+        {
+            var businessEntries = CaptureBusinessEntries();
+            var generatedValues = CaptureGeneratedValues(businessEntries);
+            var outboxEntries = AddOutboxEntries(events, timeProvider);
+            return new SaveAttempt(businessEntries, generatedValues, outboxEntries);
+        }
+
+        private OutboxSaveResult RunAttempt(SaveAttempt attempt, bool acceptAllChangesOnSuccess)
+        {
+            var result = base.SaveChanges(false);
+
+            var patches = BuildPayloadPatches(attempt, acceptAllChangesOnSuccess);
+            if (patches.Any(x => x.Changed))
+            {
+                var sql = BuildPayloadUpdateSql();
+                foreach (var patch in patches.Where(x => x.Changed))
+                {
+                    Database.ExecuteSqlRaw(sql, patch.Payload, patch.ProviderId);
+                }
+            }
+
+            return new OutboxSaveResult(result - attempt.OutboxEntries.Count, CompleteOutboxEntries(attempt.OutboxEntries, patches, acceptAllChangesOnSuccess));
+        }
+
+        private async Task<OutboxSaveResult> RunAttemptAsync(SaveAttempt attempt, bool acceptAllChangesOnSuccess, CancellationToken cancellationToken)
+        {
+            var result = await base.SaveChangesAsync(false, cancellationToken);
+
+            var patches = BuildPayloadPatches(attempt, acceptAllChangesOnSuccess);
+            if (patches.Any(x => x.Changed))
+            {
+                var sql = BuildPayloadUpdateSql();
+                foreach (var patch in patches.Where(x => x.Changed))
+                {
+                    await Database.ExecuteSqlRawAsync(sql, new[] { patch.Payload, patch.ProviderId }, cancellationToken);
+                }
+            }
+
+            return new OutboxSaveResult(result - attempt.OutboxEntries.Count, CompleteOutboxEntries(attempt.OutboxEntries, patches, acceptAllChangesOnSuccess));
+        }
+
+        /// <summary>
+        /// Puts the tracker back to its state before the failed attempt so the next attempt (execution-strategy retry
+        /// or a later save by the application) inserts everything again with fresh store-generated values: the
+        /// attempt's outbox entries are detached and the generated values captured before the attempt (temporary
+        /// keys/foreign keys, unset store-generated values) are restored. Every step is attempted; when a step fails
+        /// the original exception and the recovery failures are thrown together.
+        /// </summary>
+        private static void RecoverFailedAttempt(SaveAttempt attempt, Exception failure)
+        {
+            var errors = new List<Exception>();
+            foreach (var entry in attempt.OutboxEntries)
+            {
+                try
+                {
+                    if (entry.State != EntityState.Detached)
+                    {
+                        entry.State = EntityState.Detached;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                }
+            }
+
+            // Setter-only properties left projected for an accepting save get their pre-save value back first.
+            errors.AddRange(RestoreClrValues(attempt.DeferredClrRestores));
+            attempt.DeferredClrRestores.Clear();
+
+            RestoreGeneratedValues(attempt.GeneratedValues, errors);
+
+            if (errors.Count > 0)
+            {
+                throw new AggregateException(new[] { failure }.Concat(errors));
+            }
+        }
+
+        private IReadOnlyList<EntityEntry> CaptureBusinessEntries()
+        {
+            return ChangeTracker.Entries()
+                .Where(x => (x.State == EntityState.Added || x.State == EntityState.Modified) && !(x.Entity is OutboxMessage<TKey>))
+                .ToList();
+        }
+
+        /// <summary>
+        /// A successful <c>SaveChanges(false)</c> replaces temporary keys and propagated foreign keys with the
+        /// store-generated values and marks them as no longer temporary, and EF does not undo that when the
+        /// surrounding transaction later fails. The values that the next insert needs are captured here.
+        /// </summary>
+        private static IReadOnlyList<GeneratedValueSnapshot> CaptureGeneratedValues(IReadOnlyList<EntityEntry> businessEntries)
+        {
+            var snapshots = new List<GeneratedValueSnapshot>();
+            foreach (var entry in businessEntries)
+            {
+                if (entry.State != EntityState.Added) continue;
+
+                foreach (var property in entry.Properties)
+                {
+                    var metadata = property.Metadata;
+                    var value = property.CurrentValue;
+                    var isTemporary = property.IsTemporary;
+                    if (!isTemporary
+                        && !((metadata.ValueGenerated != ValueGenerated.Never || metadata.IsForeignKey())
+                            && metadata.GetValueComparer().Equals(value, metadata.Sentinel)))
+                    {
+                        continue;
+                    }
+
+                    // Temporary values live in the tracker, not on the entity object; its CLR value is restored too.
+                    var member = GetClrMember(metadata);
+                    snapshots.Add(new GeneratedValueSnapshot(property, value, isTemporary, member, member == null ? null : GetClrValue(member, entry.Entity)));
+                }
+            }
+            return snapshots;
+        }
+
+        private static void RestoreGeneratedValues(IReadOnlyList<GeneratedValueSnapshot> snapshots, List<Exception> errors)
+        {
+            foreach (var snapshot in snapshots)
+            {
+                try
+                {
+                    var property = snapshot.Property;
+                    if (property.EntityEntry.State != EntityState.Added) continue;
+
+                    if (!property.Metadata.GetValueComparer().Equals(property.CurrentValue, snapshot.Value))
+                    {
+                        property.CurrentValue = snapshot.Value;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                }
+            }
+
+            foreach (var snapshot in snapshots)
+            {
+                try
+                {
+                    var property = snapshot.Property;
+                    if (property.EntityEntry.State != EntityState.Added) continue;
+
+                    if (snapshot.WasTemporary && !property.IsTemporary)
+                    {
+                        property.IsTemporary = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                }
+            }
+
+            // Setting a value (or marking it temporary) also writes it to the entity object; the tracker keeps the
+            // temporary value, so the object gets its previous value back: through the backing field when EF knows
+            // one, otherwise through the property setter. Properties with neither keep the value EF wrote.
+            foreach (var snapshot in snapshots)
+            {
+                try
+                {
+                    var property = snapshot.Property;
+                    if (snapshot.Member == null || property.EntityEntry.State != EntityState.Added) continue;
+
+                    var entity = property.EntityEntry.Entity;
+                    if (!Equals(GetClrValue(snapshot.Member, entity), snapshot.ClrValue))
+                    {
+                        SetClrValue(snapshot.Member, entity, snapshot.ClrValue);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                }
+            }
+        }
+
+        private IReadOnlyList<EntityEntry<OutboxMessage<TKey>>> AddOutboxEntries(IReadOnlyList<object> events, TimeProvider timeProvider)
+        {
+            var messages = ToOutboxMessageEntity(events, timeProvider);
+            var entries = new List<EntityEntry<OutboxMessage<TKey>>>(messages.Count);
+            try
+            {
+                foreach (var message in messages)
+                {
+                    entries.Add(Add(message));
+                }
+            }
+            catch
+            {
+                // Entries added before the failure are not part of any attempt yet, so nothing else would detach them.
+                foreach (var entry in entries)
+                {
+                    entry.State = EntityState.Detached;
+                }
+                throw;
+            }
+            return entries;
+        }
+
+        private IReadOnlyList<SavedOutboxMessage> CompleteOutboxEntries(
+            IReadOnlyList<EntityEntry<OutboxMessage<TKey>>> outboxEntries,
+            IReadOnlyList<PayloadPatch> patches,
+            bool acceptAllChangesOnSuccess)
+        {
+            var payloadConverter = GetPayloadConverter();
+            var saved = new List<SavedOutboxMessage>(outboxEntries.Count);
+            for (var i = 0; i < outboxEntries.Count; i++)
+            {
+                var entry = outboxEntries[i];
+                var message = entry.Entity;
+                var originalEvent = message.Payload;
+                entry.State = EntityState.Detached;
+
+                message.Id = patches[i].Id;
+                if (!acceptAllChangesOnSuccess)
+                {
+                    // The event instance keeps default keys until the caller accepts, so dispatch what was persisted.
+                    message.Payload = payloadConverter.ConvertFromProvider(patches[i].Payload);
+                }
+                saved.Add(new SavedOutboxMessage(originalEvent, message, acceptAllChangesOnSuccess));
+            }
+            return saved;
+        }
+
+        /// <summary>
+        /// Saving with acceptAllChangesOnSuccess = false leaves store-generated values (identity keys, propagated FKs)
+        /// in the change tracker only, so the payload serialized by the INSERT carries default keys. The tracker's
+        /// current values are projected onto the entity objects while the payloads are re-serialized, then the
+        /// previous values are restored; rows whose payload differs get an UPDATE.
+        /// The backing field known to EF is used when there is one; only a mapped property without a backing field
+        /// is projected through its property setter. When the save ends by accepting the changes
+        /// (<paramref name=acceptAllChangesOnSuccess/> = true), AcceptAllChanges writes the same values to those
+        /// properties, so their restore is deferred to the failure path and the setter is not called with the
+        /// pre-save value on success (as with plain EF); otherwise the setter is invoked again to restore.
+        /// </summary>
+        private IReadOnlyList<PayloadPatch> BuildPayloadPatches(SaveAttempt attempt, bool acceptAllChangesOnSuccess)
+        {
+            var businessEntries = attempt.BusinessEntries;
+            var outboxEntries = attempt.OutboxEntries;
+            var payloadConverter = GetPayloadConverter();
+            var idProperty = Model.FindEntityType(typeof(OutboxMessage<TKey>)).FindProperty(nameof(OutboxMessage<TKey>.Id));
+            var idConverter = idProperty.GetValueConverter() ?? idProperty.GetTypeMapping().Converter;
+
+            // SaveChanges(false) writes no values to the entity objects, so this is the payload the INSERT wrote.
+            var inserted = outboxEntries.Select(x => payloadConverter.ConvertToProvider(x.Entity.Payload)).ToList();
+
+            // When the projection changes no value on any entity object, the inserted payloads are already final and
+            // no UPDATE is issued; the payloads are compared only when something was projected.
+            var projected = inserted;
+            var restore = ProjectTrackedValues(businessEntries);
+            var anyProjected = restore.Count > 0;
+            if (anyProjected)
+            {
+                try
+                {
+                    projected = outboxEntries.Select(x => payloadConverter.ConvertToProvider(x.Entity.Payload)).ToList();
+                }
+                catch (Exception ex)
+                {
+                    var restoreErrors = RestoreClrValues(restore);
+                    if (restoreErrors.Count > 0)
+                    {
+                        throw new AggregateException(new[] { ex }.Concat(restoreErrors));
+                    }
+                    throw;
+                }
+                if (acceptAllChangesOnSuccess)
+                {
+                    attempt.DeferredClrRestores.AddRange(restore.Where(x => !(x.Member is System.Reflection.FieldInfo)));
+                    restore = restore.Where(x => x.Member is System.Reflection.FieldInfo).ToList();
+                }
+                ThrowIfAny(RestoreClrValues(restore));
+            }
+
+            var patches = new List<PayloadPatch>(outboxEntries.Count);
+            for (var i = 0; i < outboxEntries.Count; i++)
+            {
+                var idEntry = outboxEntries[i].Property(x => x.Id);
+                if (idEntry.IsTemporary)
+                {
+                    throw new InvalidOperationException($"The key of the saved '{typeof(OutboxMessage<TKey>).Name}' is still a temporary value.");
+                }
+                var id = (TKey)idEntry.CurrentValue;
+                var providerId = idConverter != null ? idConverter.ConvertToProvider(id) : id;
+                patches.Add(new PayloadPatch(id, providerId, projected[i], anyProjected && !Equals(inserted[i], projected[i])));
+            }
+            return patches;
+        }
+
+        private static List<ClrValue> ProjectTrackedValues(IReadOnlyList<EntityEntry> entries)
+        {
+            var restore = new List<ClrValue>();
+            try
+            {
+                foreach (var entry in entries)
+                {
+                    foreach (var property in entry.Properties)
+                    {
+                        var metadata = property.Metadata;
+                        if (metadata.IsShadowProperty() || metadata.IsIndexerProperty() || property.IsTemporary) continue;
+
+                        var member = GetClrMember(metadata);
+                        if (member == null) continue;
+
+                        var clrValue = GetClrValue(member, entry.Entity);
+                        var currentValue = property.CurrentValue;
+                        if (metadata.GetValueComparer().Equals(clrValue, currentValue)) continue;
+
+                        SetClrValue(member, entry.Entity, currentValue);
+                        restore.Add(new ClrValue(member, entry.Entity, clrValue));
                     }
                 }
             }
-            else
+            catch (Exception ex)
             {
-                result = await base.SaveChangesAsync(cancellationToken);
+                var restoreErrors = RestoreClrValues(restore);
+                if (restoreErrors.Count > 0)
+                {
+                    throw new AggregateException(new[] { ex }.Concat(restoreErrors));
+                }
+                throw;
             }
-
-            return result;
+            return restore;
         }
 
-        private ICollection<OutboxMessage<TKey>> ToOutboxMessageEntity(IOutbox outbox, TimeProvider timeProvider)
+        /// <summary>Attempts every restore, returning the failures instead of stopping at the first one.</summary>
+        private static List<Exception> RestoreClrValues(IReadOnlyList<ClrValue> values)
         {
-            var events = outbox.GetEvents();
-            if(events?.Any() != true) return [];
+            var errors = new List<Exception>();
+            foreach (var item in values)
+            {
+                try
+                {
+                    SetClrValue(item.Member, item.Entity, item.Value);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                }
+            }
+            return errors;
+        }
 
+        /// <summary>
+        /// The member used to read and write a mapped property's value on the entity object: the backing field known
+        /// to EF when there is one, otherwise the CLR property when it can be read and written (its setter is then
+        /// invoked). Returns null for shadow/indexer properties and properties that cannot be written.
+        /// </summary>
+        private static System.Reflection.MemberInfo GetClrMember(IProperty metadata)
+        {
+            if (metadata.IsShadowProperty() || metadata.IsIndexerProperty()) return null;
+            if (metadata.FieldInfo != null) return metadata.FieldInfo;
+
+            var propertyInfo = metadata.PropertyInfo;
+            return propertyInfo != null && propertyInfo.CanRead && propertyInfo.CanWrite ? propertyInfo : null;
+        }
+
+        private static object GetClrValue(System.Reflection.MemberInfo member, object entity)
+        {
+            return member is System.Reflection.FieldInfo field
+                ? field.GetValue(entity)
+                : ((System.Reflection.PropertyInfo)member).GetValue(entity);
+        }
+
+        private static void SetClrValue(System.Reflection.MemberInfo member, object entity, object value)
+        {
+            if (member is System.Reflection.FieldInfo field)
+            {
+                field.SetValue(entity, value);
+            }
+            else
+            {
+                ((System.Reflection.PropertyInfo)member).SetValue(entity, value);
+            }
+        }
+
+        private static void ThrowIfAny(List<Exception> errors)
+        {
+            if (errors.Count == 1) ExceptionDispatchInfo.Capture(errors[0]).Throw();
+            if (errors.Count > 1) throw new AggregateException(errors);
+        }
+
+        private ValueConverter GetPayloadConverter()
+        {
+            var payloadProperty = Model.FindEntityType(typeof(OutboxMessage<TKey>)).FindProperty(nameof(OutboxMessage<TKey>.Payload));
+            return payloadProperty.GetValueConverter() ?? payloadProperty.GetTypeMapping().Converter
+                ?? throw new InvalidOperationException($"'{typeof(OutboxMessage<TKey>).Name}.{nameof(OutboxMessage<TKey>.Payload)}' has no value converter.");
+        }
+
+        private string BuildPayloadUpdateSql()
+        {
+            var entityType = Model.FindEntityType(typeof(OutboxMessage<TKey>));
+            var table = StoreObjectIdentifier.Table(entityType.GetTableName(), entityType.GetSchema());
+            var payloadColumn = entityType.FindProperty(nameof(OutboxMessage<TKey>.Payload)).GetColumnName(table);
+            var idColumn = entityType.FindProperty(nameof(OutboxMessage<TKey>.Id)).GetColumnName(table);
+            var sql = this.GetService<ISqlGenerationHelper>();
+
+            // ExecuteSqlRaw formats the text with the parameter placeholders, so braces in identifiers are escaped.
+            return $"UPDATE {EscapeFormat(sql.DelimitIdentifier(table.Name, table.Schema))} SET {EscapeFormat(sql.DelimitIdentifier(payloadColumn))} = {{0}} WHERE {EscapeFormat(sql.DelimitIdentifier(idColumn))} = {{1}}";
+        }
+
+        private static string EscapeFormat(string text) => text.Replace("{", "{{").Replace("}", "}}");
+
+        private ICollection<OutboxMessage<TKey>> ToOutboxMessageEntity(IReadOnlyList<object> events, TimeProvider timeProvider)
+        {
             var outboxOptions = this.GetService<IOptions<OutboxConfiguration>>()?.Value;
 
-            return outbox.GetEvents().Select(x => new OutboxMessage<TKey>
+            return events.Select(x => new OutboxMessage<TKey>
             {
-                Id = IsPrimaryKeyAutoGenerated(this, x) ? default : GetId(),
                 Type = x.GetType().AssemblyQualifiedName,
                 Payload = x,
                 Created = timeProvider.GetUtcNow().DateTime,
@@ -140,57 +1110,119 @@ namespace XDev.Outbox.EFCore
             }).ToList();
         }
 
-        private int AddOutboxMessages(ICollection<OutboxMessage<TKey>> outboxMessages)
+        private sealed class SaveAttempt
         {
-            if (outboxMessages?.Any() != true) return 0;
-            var stagedOutboxMessages = ChangeTracker.Entries<OutboxMessage<TKey>>().Select(x => x.Entity);
-            var addedCount = 0;
-            foreach (var item in outboxMessages.Where(x => !stagedOutboxMessages.Any(m => m.Payload == x.Payload)))
+            public SaveAttempt(
+                IReadOnlyList<EntityEntry> businessEntries,
+                IReadOnlyList<GeneratedValueSnapshot> generatedValues,
+                IReadOnlyList<EntityEntry<OutboxMessage<TKey>>> outboxEntries)
             {
-                item.Id = GetDefaultValue<TKey>();
-                OutboxMessages.Add(item);
-                addedCount++;
+                BusinessEntries = businessEntries;
+                GeneratedValues = generatedValues;
+                OutboxEntries = outboxEntries;
             }
-            return addedCount;
+
+            public IReadOnlyList<EntityEntry> BusinessEntries { get; }
+            public IReadOnlyList<GeneratedValueSnapshot> GeneratedValues { get; }
+            public IReadOnlyList<EntityEntry<OutboxMessage<TKey>>> OutboxEntries { get; }
+
+            /// <summary>Setter-only properties left projected because the save accepts the changes; restored only if the attempt fails.</summary>
+            public List<ClrValue> DeferredClrRestores { get; } = new List<ClrValue>();
         }
 
-        private static bool IsPrimaryKeyAutoGenerated<TEntity>(DbContext context, TEntity entity) where TEntity : class
+        private sealed class GeneratedValueSnapshot
         {
-            // 1. Find the entity metadata structure
-            var entityType = context.Model.FindEntityType(typeof(TEntity));
-            if (entityType == null) return false;
-
-            // 2. Fetch the primary key
-            var primaryKey = entityType.FindPrimaryKey();
-            if (primaryKey == null) return false;
-
-            // 3. Verify if any of the key properties are generated on insert
-            return primaryKey.Properties.Any(p => p.ValueGenerated == ValueGenerated.OnAdd);
-        }
-
-        private TKey GetId()
-        {
-            if (typeof(TKey) == typeof(string))
+            public GeneratedValueSnapshot(PropertyEntry property, object value, bool wasTemporary, System.Reflection.MemberInfo member, object clrValue)
             {
-                return (TKey)Convert.ChangeType(Guid.NewGuid().ToString(), typeof(TKey));
+                Property = property;
+                Value = value;
+                WasTemporary = wasTemporary;
+                Member = member;
+                ClrValue = clrValue;
             }
-            if (typeof(TKey) == typeof(Guid))
+
+            public PropertyEntry Property { get; }
+            public object Value { get; }
+            public bool WasTemporary { get; }
+
+            /// <summary>The backing field, or the CLR property when the property has no backing field; null when neither is usable.</summary>
+            public System.Reflection.MemberInfo Member { get; }
+            public object ClrValue { get; }
+        }
+
+        private sealed class ClrValue
+        {
+            public ClrValue(System.Reflection.MemberInfo member, object entity, object value)
             {
-                return (TKey)Convert.ChangeType(Guid.NewGuid(), typeof(TKey));
+                Member = member;
+                Entity = entity;
+                Value = value;
             }
-            return default;
+
+            /// <summary>The backing field, or the CLR property when the property has no backing field.</summary>
+            public System.Reflection.MemberInfo Member { get; }
+            public object Entity { get; }
+            public object Value { get; }
         }
 
-        object GetDefaultValue(Type t)
+        private sealed class IdHolder
         {
-            if (t.IsValueType)
-                return Activator.CreateInstance(t);
-            return null;
+            public IdHolder(TKey value) => Value = value;
+
+            public TKey Value { get; }
         }
 
-        T GetDefaultValue<T>()
+        private sealed class OutboxSaveResult
         {
-            return default(T);
+            public OutboxSaveResult(int result, IReadOnlyList<SavedOutboxMessage> messages)
+            {
+                Result = result;
+                Messages = messages;
+            }
+
+            public int Result { get; }
+            public IReadOnlyList<SavedOutboxMessage> Messages { get; }
+        }
+
+        private sealed class SavedOutboxMessage
+        {
+            public SavedOutboxMessage(object @event, OutboxMessage<TKey> message, bool acceptedChanges)
+            {
+                Event = @event;
+                Message = message;
+                AcceptedChanges = acceptedChanges;
+            }
+
+            public object Event { get; }
+            public OutboxMessage<TKey> Message { get; }
+
+            /// <summary>
+            /// The business changes saved with this message were accepted: by its own save (acceptAllChangesOnSuccess
+            /// = true) or by a later save in the same transaction with acceptAllChangesOnSuccess = true.
+            /// </summary>
+            public bool AcceptedChanges { get; set; }
+
+            /// <summary>
+            /// A rollback to a savepoint happened and the check of which rows it undid failed: the row may or may not
+            /// exist, so the message is not dispatched in memory until a later check confirms it.
+            /// </summary>
+            public bool Unconfirmed { get; set; }
+        }
+
+        private sealed class PayloadPatch
+        {
+            public PayloadPatch(TKey id, object providerId, object payload, bool changed)
+            {
+                Id = id;
+                ProviderId = providerId;
+                Payload = payload;
+                Changed = changed;
+            }
+
+            public TKey Id { get; }
+            public object ProviderId { get; }
+            public object Payload { get; }
+            public bool Changed { get; }
         }
     }
 }

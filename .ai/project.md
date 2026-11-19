@@ -51,7 +51,8 @@ library gives to consuming applications.
 - `README.md` (root) is a copy of `src/XDev.Outbox.EFCore/README.md`, which is
   the NuGet package readme.
 
-There are no test projects and no CI configuration in the repository.
+`tests/XDev.Outbox.EFCore.Tests` (xUnit, SQLite in-memory, net8 to net11)
+covers the EF Core save and dispatch path. There is no CI configuration.
 
 ## Domain Terminology
 
@@ -105,7 +106,19 @@ transitively into `XDev.Outbox.EFCore`.
 
 ### Unit Tests
 
-None exist. There is no test project.
+```
+dotnet test tests/XDev.Outbox.EFCore.Tests -f net8.0
+dotnet test tests/XDev.Outbox.EFCore.Tests -f net9.0
+dotnet test tests/XDev.Outbox.EFCore.Tests -f net10.0
+dotnet test tests/XDev.Outbox.EFCore.Tests -f net11.0
+```
+
+Run all four target frameworks; EF behavior differs by version.
+
+- The tests use SQLite in-memory, so SQL Server is not needed.
+- On 2026-11-18 each framework reported 389 tests: 388 passed and 1 skipped.
+  The skipped test is the deferred D5 limitation.
+- Coverage is limited to `XDev.Outbox.EFCore`. The core runtime has no tests.
 
 ### Integration Tests
 

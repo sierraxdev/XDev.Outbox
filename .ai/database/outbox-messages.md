@@ -36,9 +36,21 @@ No indexes beyond the PK are defined.
 
 ## Writes
 
-- **Insert**: in `OutboxDbContext.SaveChangesAsync`, in the same transaction
-  as the business changes, by a second `base.SaveChangesAsync` call. See
-  `components/efcore-outbox-store.md`.
+- **Insert**: in the same `SaveChanges(false)` call as the business changes,
+  inside one transaction.
+- **Payload update**: when generated keys change the serialized payload, the
+  save also runs
+  `UPDATE <table> SET <Payload> = {0} WHERE <Id> = {1}` in the same
+  transaction:
+  - parameterized, with model identifiers delimited and braces escaped;
+  - one statement per changed message.
+
+  See `components/efcore-outbox-store.md`.
+- **Savepoint existence check**: in a caller transaction, after
+  `RollbackToSavepoint`, or before commit when messages are unconfirmed, the
+  library runs `SELECT ... WHERE Id = @p0 OR ...`:
+  - batches of 100;
+  - query filters ignored.
 - **Claim (update)**: `EntityFrameworkOutboxStore.GetAllAsync`. One statement:
 
   ```sql
