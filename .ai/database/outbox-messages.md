@@ -46,6 +46,12 @@ No indexes beyond the PK are defined.
   - one statement per changed message.
 
   See `components/efcore-outbox-store.md`.
+- **Library savepoint**: in a caller transaction, each save with events
+  runs inside `SAVE TRANSACTION [__XDevOutboxSavePoint]` (when savepoints are
+  available), in addition to EF's own `__EFSavePoint`; a failure after the
+  INSERTs rolls back to it, undoing the INSERTs and any payload UPDATEs.
+  SQL Server never releases savepoints, so names accumulate; rollback targets
+  the most recent. See `decisions/003-...`.
 - **Savepoint existence check**: in a caller transaction, after
   `RollbackToSavepoint`, or before commit when messages are unconfirmed, the
   library runs `SELECT ... WHERE Id = @p0 OR ...`:

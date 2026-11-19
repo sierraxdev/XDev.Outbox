@@ -16,8 +16,9 @@ namespace XDev.Outbox.EFCore
     /// are still pending and will be saved again) and are removed otherwise.
     /// Such an event stays buffered until it is saved again or its changes are accepted, also across later transactions
     /// that end without saving it. A rollback to a savepoint drops the messages whose rows it undid, with the same
-    /// buffer rule. When the rows a rollback to a savepoint undid cannot be determined even just before the commit, the
-    /// commit proceeds, the affected messages are left to the outbox poller and a warning is logged under
+    /// buffer rule; rollbacks to savepoints made inside a save (EF's own, and the context's savepoint undoing a
+    /// failed save with events) are ignored, since they cannot undo rows of earlier saves. When the rows a rollback
+    /// to a savepoint undid cannot be determined even just before the commit, the commit proceeds, the affected messages are left to the outbox poller and a warning is logged under
     /// <c>Microsoft.EntityFrameworkCore.Database.Transaction</c> with event id 41001
     /// (<c>XDev.Outbox.EFCore.UnconfirmedPendingMessagesAtCommit</c>).
     /// The buffer itself (<see cref="OutboxDbContext{TKey, TContext}.Outbox"/>) is updated by the context

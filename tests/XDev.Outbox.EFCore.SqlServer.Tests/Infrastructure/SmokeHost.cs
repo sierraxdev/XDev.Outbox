@@ -55,6 +55,9 @@ public sealed class SmokeHostOptions
 
     /// <summary>Use the library's MemoryMessageQueue (real dispatch) instead of the recording queue.</summary>
     public bool RealQueue { get; init; }
+
+    /// <summary>MultipleActiveResultSets=True on the context's connection string (EF then uses no savepoints).</summary>
+    public bool MultipleActiveResultSets { get; init; }
 }
 
 /// <summary>
@@ -100,7 +103,10 @@ public sealed class SmokeHost<TKey, TContext> : IDisposable
 
         void ConfigureContext(DbContextOptionsBuilder builder)
         {
-            builder.UseSqlServer(database.ConnectionString, sql =>
+            var connectionString = options.MultipleActiveResultSets
+                ? new Microsoft.Data.SqlClient.SqlConnectionStringBuilder(database.ConnectionString) { MultipleActiveResultSets = true }.ConnectionString
+                : database.ConnectionString;
+            builder.UseSqlServer(connectionString, sql =>
             {
                 if (options.RetryingStrategy) sql.ExecutionStrategy(d => new SmokeRetryingExecutionStrategy(d));
             });

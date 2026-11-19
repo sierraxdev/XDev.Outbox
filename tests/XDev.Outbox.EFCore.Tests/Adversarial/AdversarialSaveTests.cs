@@ -463,11 +463,11 @@ public class AdversarialSaveTests
     }
 
     /// <summary>
-    /// D5 (deferred): inside a caller transaction the library's payload UPDATE runs after EF's own savepoint is
-    /// released, so a failure there leaves business and outbox rows in the caller's transaction while the
-    /// tracker still says Added. Plain EF semantics would make retrying the save safe.
+    /// D5: inside a caller transaction the library's payload UPDATE runs after EF's own savepoint is released; the
+    /// library's own savepoint around the whole outbox save undoes the rows of a failed save, so retrying the save
+    /// in the same transaction is safe, as with plain EF.
     /// </summary>
-    [Theory(Skip = "D5 deferred (no ambient savepoint). Confirmed failing on net8.0-net11.0: 2 Users rows after the caller's retry and commit.")]
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task AmbientSave_WhenPayloadUpdateFailsAndCallerRetriesThenCommits_NoDuplicateRows(bool async)

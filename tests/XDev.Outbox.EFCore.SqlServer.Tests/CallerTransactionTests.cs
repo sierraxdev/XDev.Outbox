@@ -233,11 +233,11 @@ public class CallerTransactionTests : IClassFixture<SmokeDatabaseFixture>
     }
 
     /// <summary>
-    /// D5 (known, deferred): the payload UPDATE runs after EF released its savepoint, so when it fails inside a caller
-    /// transaction the INSERTs stay in the transaction while the tracker is restored to Added; retrying in the same
-    /// transaction duplicates the business rows. Asserts the correct behavior; skipped while D5 is deferred.
+    /// D5: the payload UPDATE runs after EF released its savepoint; when it fails inside a caller transaction the
+    /// library rolls back to its own savepoint (taken before EF's save) and restores the tracker, so retrying in the
+    /// same transaction persists every row once.
     /// </summary>
-    [SqlServerTheory(Skip = "D5 deferred (known limitation). Reproduced on SQL Server (net8.0-net11.0), both timings: after the caller's retry and commit there are 3 Users rows instead of 2 and 3 outbox rows instead of 2 (the failed attempt's row keeps the default-key payload and is never dispatched in memory; the poller would deliver it).")]
+    [SqlServerTheory]
     [InlineData(FaultTiming.BeforeExecution, false)]
     [InlineData(FaultTiming.BeforeExecution, true)]
     [InlineData(FaultTiming.AfterExecution, false)]

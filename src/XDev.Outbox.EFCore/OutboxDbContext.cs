@@ -36,6 +36,13 @@ namespace XDev.Outbox.EFCore
     //
     // State machine for events saved inside a caller-owned transaction (owned saves commit and dispatch in one step).
     //
+    // A save with events inside a caller transaction runs inside the library's savepoint (__XDevOutboxSavePoint, when
+    // the transaction supports savepoints and Database.AutoSavepointsEnabled is true, like EF's own savepoint). When
+    // anything after its creation fails (EF's save, payload re-serialization, payload UPDATEs, completion), the save
+    // rolls back to it and restores the tracker, so it leaves nothing behind and can be retried in the transaction;
+    // no message becomes pending. Without a savepoint, or when that rollback fails, the writes stay in the transaction
+    // and warning 41002 (CallerTransactionSaveNotUndoneEventId) tells the caller to roll back.
+    //
     // A save with events inside a caller transaction records one pending message per event (_pendingOutboxMessages,
     // tied to _pendingTransactionId); its event stays in the buffer and is not saved again in that transaction.
     // Pending message states:
@@ -69,6 +76,21 @@ namespace XDev.Outbox.EFCore
         /// dispatched in memory and committed rows are delivered by the outbox poller.
         /// </summary>
         private static readonly EventId UnconfirmedAtCommitEventId = new EventId(41001, "XDev.Outbox.EFCore.UnconfirmedPendingMessagesAtCommit");
+
+        /// <summary>
+        /// Event id of the warning logged (category <c>Microsoft.EntityFrameworkCore.Database.Transaction</c>) when a
+        /// save with events failed inside a caller-owned transaction after EF had written its changes, and those
+        /// changes could not be undone: the rollback to the library's savepoint failed, or no savepoint was used
+        /// (the transaction does not support savepoints, e.g. SQL Server with MARS, or
+        /// <c>Database.AutoSavepointsEnabled</c> is false). Id 41002, name
+        /// <c>XDev.Outbox.EFCore.CallerTransactionSaveNotUndone</c>. The original exception is still thrown; the
+        /// caller must roll back the transaction instead of retrying the save in it.
+        /// </summary>
+        private static readonly EventId CallerTransactionSaveNotUndoneEventId = new EventId(41002, "XDev.Outbox.EFCore.CallerTransactionSaveNotUndone");
+
+        // Savepoint around a save with events in a caller-owned transaction (distinct from EF's "__EFSavePoint"; SQL
+        // Server limits savepoint names to 32 characters).
+        private const string OutboxSavepointName = "__XDevOutboxSavePoint";
 
         // Messages saved inside a caller-owned transaction; dispatched by the interceptor when that transaction commits.
         private readonly List<SavedOutboxMessage> _pendingOutboxMessages = new List<SavedOutboxMessage>();
@@ -168,16 +190,29 @@ namespace XDev.Outbox.EFCore
                 return plainResult;
             }
 
-            if (Database.CurrentTransaction != null)
+            var callerTransaction = Database.CurrentTransaction;
+            if (callerTransaction != null)
             {
+                var useSavepoint = UseOutboxSavepoint(callerTransaction);
                 var ambientAttempt = BeginAttempt(events, timeProvider);
+                var savepointCreated = false;
                 OutboxSaveResult ambient;
                 try
                 {
+                    if (useSavepoint)
+                    {
+                        callerTransaction.CreateSavepoint(OutboxSavepointName);
+                        savepointCreated = true;
+                    }
                     ambient = RunAttempt(ambientAttempt, acceptAllChangesOnSuccess);
+                    if (savepointCreated)
+                    {
+                        callerTransaction.ReleaseSavepoint(OutboxSavepointName);
+                    }
                 }
                 catch (Exception ex)
                 {
+                    UndoFailedAmbientAttempt(callerTransaction, savepointCreated, ambientAttempt);
                     RecoverFailedAttempt(ambientAttempt, ex);
                     throw;
                 }
@@ -237,16 +272,29 @@ namespace XDev.Outbox.EFCore
                 return plainResult;
             }
 
-            if (Database.CurrentTransaction != null)
+            var callerTransaction = Database.CurrentTransaction;
+            if (callerTransaction != null)
             {
+                var useSavepoint = UseOutboxSavepoint(callerTransaction);
                 var ambientAttempt = BeginAttempt(events, timeProvider);
+                var savepointCreated = false;
                 OutboxSaveResult ambient;
                 try
                 {
+                    if (useSavepoint)
+                    {
+                        await callerTransaction.CreateSavepointAsync(OutboxSavepointName, cancellationToken);
+                        savepointCreated = true;
+                    }
                     ambient = await RunAttemptAsync(ambientAttempt, acceptAllChangesOnSuccess, cancellationToken);
+                    if (savepointCreated)
+                    {
+                        await callerTransaction.ReleaseSavepointAsync(OutboxSavepointName, cancellationToken);
+                    }
                 }
                 catch (Exception ex)
                 {
+                    await UndoFailedAmbientAttemptAsync(callerTransaction, savepointCreated, ambientAttempt);
                     RecoverFailedAttempt(ambientAttempt, ex);
                     throw;
                 }
@@ -416,7 +464,8 @@ namespace XDev.Outbox.EFCore
 
         private bool ShouldCheckSavepointRollback(Guid transactionId)
         {
-            // Savepoints EF creates inside a save never cover messages saved by an earlier save.
+            // Savepoints rolled back inside a save (EF's own, and the library's savepoint after a failed save with
+            // events) were created inside that save, so they never cover messages saved by an earlier save.
             return _saveDepth == 0 && _pendingTransactionId == transactionId && _pendingOutboxMessages.Count > 0;
         }
 
@@ -459,6 +508,99 @@ namespace XDev.Outbox.EFCore
                 exception,
                 "Could not confirm {Count} pending outbox message(s) before commit; they are not dispatched in memory and are delivered by the outbox poller if committed.",
                 _pendingOutboxMessages.Count(x => x.Unconfirmed));
+        }
+
+        /// <summary>
+        /// Whether a save with events in the caller's transaction is wrapped in the library's savepoint: under the same
+        /// conditions as EF's own savepoint around a save (the transaction supports savepoints and
+        /// <c>Database.AutoSavepointsEnabled</c> is true). AutoSavepointsEnabled is read first because reading
+        /// SupportsSavepoints on SQL Server with MARS logs a warning.
+        /// </summary>
+        private bool UseOutboxSavepoint(IDbContextTransaction transaction)
+        {
+            return Database.AutoSavepointsEnabled && transaction.SupportsSavepoints;
+        }
+
+        /// <summary>
+        /// Undoes, inside the caller's transaction, what a failed save with events wrote, so that the save can be
+        /// retried in the same transaction: rolls back to the library's savepoint (created before EF's save) and
+        /// releases it. The rollback happens inside the save (_saveDepth &gt; 0), so the transaction interceptor does
+        /// not check pending messages of earlier saves (the savepoint postdates them). When the rollback fails, or
+        /// no savepoint was used and EF's save had already written, the writes stay in the transaction: that error is
+        /// not thrown (EF logged it; the caller gets the original exception) and warning 41002 is logged.
+        /// </summary>
+        private void UndoFailedAmbientAttempt(IDbContextTransaction transaction, bool savepointCreated, SaveAttempt attempt)
+        {
+            if (!savepointCreated)
+            {
+                if (attempt.BaseSaveCompleted) LogCallerTransactionSaveNotUndone(null, savepointUsed: false);
+                return;
+            }
+
+            try
+            {
+                transaction.RollbackToSavepoint(OutboxSavepointName);
+            }
+            catch (Exception rollbackError)
+            {
+                LogCallerTransactionSaveNotUndone(rollbackError, savepointUsed: true);
+                return;
+            }
+
+            try
+            {
+                transaction.ReleaseSavepoint(OutboxSavepointName);
+            }
+            catch (Exception)
+            {
+                // Best effort: the writes are already undone and EF logged the failure; a savepoint left in the
+                // transaction changes nothing for the caller.
+            }
+        }
+
+        /// <summary>
+        /// Async counterpart of <see cref="UndoFailedAmbientAttempt"/>. The caller's token is not used: a cancelled save
+        /// must still be undone.
+        /// </summary>
+        private async Task UndoFailedAmbientAttemptAsync(IDbContextTransaction transaction, bool savepointCreated, SaveAttempt attempt)
+        {
+            if (!savepointCreated)
+            {
+                if (attempt.BaseSaveCompleted) LogCallerTransactionSaveNotUndone(null, savepointUsed: false);
+                return;
+            }
+
+            try
+            {
+                await transaction.RollbackToSavepointAsync(OutboxSavepointName, CancellationToken.None);
+            }
+            catch (Exception rollbackError)
+            {
+                LogCallerTransactionSaveNotUndone(rollbackError, savepointUsed: true);
+                return;
+            }
+
+            try
+            {
+                await transaction.ReleaseSavepointAsync(OutboxSavepointName, CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                // Best effort: the writes are already undone and EF logged the failure; a savepoint left in the
+                // transaction changes nothing for the caller.
+            }
+        }
+
+        private void LogCallerTransactionSaveNotUndone(Exception rollbackError, bool savepointUsed)
+        {
+            var logger = this.GetService<IDiagnosticsLogger<DbLoggerCategory.Database.Transaction>>();
+            logger?.Logger.LogWarning(
+                CallerTransactionSaveNotUndoneEventId,
+                rollbackError,
+                "A save with outbox events failed inside a transaction owned by the application after its changes were written, and they could not be undone ({Reason}). Roll back the transaction; do not retry the save in it.",
+                savepointUsed
+                    ? "the rollback to the outbox savepoint failed"
+                    : "no savepoint is used: the transaction does not support savepoints or Database.AutoSavepointsEnabled is false");
         }
 
         private HashSet<TKey> QueryExistingPendingIds()
@@ -754,6 +896,7 @@ namespace XDev.Outbox.EFCore
         private OutboxSaveResult RunAttempt(SaveAttempt attempt, bool acceptAllChangesOnSuccess)
         {
             var result = base.SaveChanges(false);
+            attempt.BaseSaveCompleted = true;
 
             var patches = BuildPayloadPatches(attempt, acceptAllChangesOnSuccess);
             if (patches.Any(x => x.Changed))
@@ -771,6 +914,7 @@ namespace XDev.Outbox.EFCore
         private async Task<OutboxSaveResult> RunAttemptAsync(SaveAttempt attempt, bool acceptAllChangesOnSuccess, CancellationToken cancellationToken)
         {
             var result = await base.SaveChangesAsync(false, cancellationToken);
+            attempt.BaseSaveCompleted = true;
 
             var patches = BuildPayloadPatches(attempt, acceptAllChangesOnSuccess);
             if (patches.Any(x => x.Changed))
@@ -1178,6 +1322,9 @@ namespace XDev.Outbox.EFCore
 
             /// <summary>Setter-only properties left projected because the save accepts the changes; restored only if the attempt fails.</summary>
             public List<ClrValue> DeferredClrRestores { get; } = new List<ClrValue>();
+
+            /// <summary>EF's save of this attempt succeeded: its changes are in the transaction until it ends or is rolled back to a savepoint.</summary>
+            public bool BaseSaveCompleted { get; set; }
         }
 
         private sealed class GeneratedValueSnapshot

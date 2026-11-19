@@ -235,10 +235,34 @@ constructor throws naming the registration methods.
 
 ## Known Limitations
 
-- **D5 (deferred by the user).** In a caller transaction, the payload UPDATE
-  runs after EF releases its own savepoint. If that UPDATE fails and the caller
-  retries inside the same transaction, the business rows are duplicated. The
-  test for this is skipped.
+- **Caller-transaction saves are all-or-nothing only with savepoints
+  (decision 003, fixes D5).** Each outbox save in a caller transaction runs
+  inside savepoint `__XDevOutboxSavePoint` (reserved name) when
+  `Database.AutoSavepointsEnabled && SupportsSavepoints`. On failure the
+  library rolls back to it (async with `CancellationToken.None`), then
+  restores the tracker, then rethrows the original exception. Without
+  savepoints (SQL Server MARS, `AutoSavepointsEnabled=false`) the old
+  behavior remains: roll back the transaction after any failed save. If the
+  rollback fails (doomed transaction, e.g. `XACT_ABORT`, SQL error 3903), or
+  no savepoint existed and EF's save had completed, warning EventId 41002
+  `XDev.Outbox.EFCore.CallerTransactionSaveNotUndone` is logged.
+- **Explicit rollback after a failed save loses the event (open, needs a
+  decision).** After a failed caller-transaction save the business entity is
+  still Added but no message is pending. An explicit `Rollback()` drops the
+  never-saved event, so a later save in a new transaction commits the entity
+  without an outbox row. Disposing the transaction without `Rollback()` keeps
+  the event. Pinned by
+  `FailedSave_CallerRollsBackExplicitly_RetryInNewTransactionCommitsUserWithoutOutboxRow`.
+- **Retry after EF's own save fails partway (open, pre-existing).** If an
+  earlier command of EF's save ran (outbox INSERT got a key) and a later one
+  failed, EF reverts the entry to a temporary key but its identity map keeps
+  the generated key. `RecoverFailedAttempt` detaches through the cached
+  `EntityEntry` (no DetectChanges), leaving a stale identity-map entry. On
+  SQLite the rolled-back rowid is reused, so the retry throws "cannot be
+  tracked ... same key" (owned, caller and retrying-strategy paths). Latent on
+  SQL Server (identity values not reused). Plain-EF experiment: detaching via
+  a fresh `context.Entry(entity)` avoids it. Skipped tests in
+  `CallerTransactionPartialSave/RetryAfterPartialEfSaveTests.cs`.
 - **Guarded setters on setter-only keys.** A setter that rejects the default
   value fails flag=false saves and failure recovery. The failure surfaces as an
   `AggregateException`.
@@ -261,9 +285,11 @@ constructor throws naming the registration methods.
   net8 options path, and Guid keys. Payload parameters are `nvarchar(4000)`
   up to 4000 chars and `nvarchar(max)` above, with no implicit conversion;
   large and non-ASCII payloads round-trip exactly. The payload UPDATE is one
-  round trip per message. D5 reproduces. Not covered: real transient
-  `SqlException`s, commit-unknown outcomes, MARS, Azure SQL, factory
-  registrations on SQL Server.
+  round trip per message. D5 is fixed and verified there, including doomed
+  transactions and MARS (fallback). Savepoints per save: owned 1 (EF's),
+  caller with events 2, caller without events 1. Not covered: real
+  transient `SqlException`s and deadlocks, commit-unknown outcomes, Azure
+  SQL, factory registrations on SQL Server.
 - **`TransactionScope` and InMemory.** These are unsupported on every overload:
   the save path requires relational transactions.
 

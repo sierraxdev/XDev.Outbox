@@ -58,8 +58,8 @@ Two findings from EF Core source and tests, confirmed on EF 8–11:
 - **D3:** after a flag=false save, subscribers receive the payload rebuilt
   from JSON.
 - **D4:** `AutoTransactionBehavior` is no longer modified.
-- **D5:** deferred. There is no savepoint around the payload `UPDATE` in caller
-  transactions.
+- **D5:** deferred here; fixed on 2026-11-19 by
+  `decisions/003-library-savepoint-for-caller-transaction-saves.md`.
 
 ## Rationale
 
@@ -97,6 +97,6 @@ Two findings from EF Core source and tests, confirmed on EF 8–11:
 ## Verification
 
 - `tests/XDev.Outbox.EFCore.Tests` (389 tests) must pass on net8, net9, net10
-  and net11. The only accepted skip is the D5 test.
+  and net11.
 - Verified on SQL Server LocalDB on 2026-11-19
-  (`tests/XDev.Outbox.EFCore.SqlServer.Tests`); D5 reproduces there.
+  (`tests/XDev.Outbox.EFCore.SqlServer.Tests`).
