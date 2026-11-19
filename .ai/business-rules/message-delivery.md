@@ -15,8 +15,16 @@ Each rule is labeled:
 
 ## Publishing
 
-- [Confirmed] Events are any CLR object passed to `IOutbox.AddEvent(params object[])`.
-  `IOutbox` is scoped, so events belong to the DI scope that resolved it.
+- [Confirmed] Events are any CLR object passed to
+  `dbContext.Outbox.AddEvent(params object[])`. Events belong to that
+  `OutboxDbContext` **instance**; only its saves persist them, and they are
+  discarded if the context is disposed or returned to its pool unsaved.
+  (Before 2026-11-19 the buffer was a DI-scoped `IOutbox`; it is no longer
+  registered, and injecting it fails at resolution. Decision 002.)
+- [Confirmed] All registration kinds are supported: `AddDbContext`,
+  `AddDbContextPool`, `AddDbContextFactory` (any lifetime),
+  `AddPooledDbContextFactory`. Pooled contexts never carry events or pending
+  state into the next lease.
 - [Confirmed] **All four** public save overloads persist buffered events
   atomically with the business changes: `SaveChanges()`, `SaveChanges(bool)`,
   `SaveChangesAsync(ct)`, and `SaveChangesAsync(bool, ct)`. Events are
@@ -34,10 +42,10 @@ Each rule is labeled:
   that entity's store-generated keys and FKs. This holds for both flag values.
   A key value copied into the event at `AddEvent` time is still the default.
   See `components/efcore-outbox-store.md` for the mechanism.
-- [Confirmed] Every save on an `OutboxDbContext` resolves `IOutbox` and
-  `IMessageQueue<TKey>` through EF's `GetService<T>()`, which throws when a
-  service is missing. `AddOutbox` must therefore be registered, even for saves
-  with no buffered events.
+- [Confirmed] Every save on an `OutboxDbContext` resolves
+  `IMessageQueue<TKey>` and `TimeProvider` through EF's `GetService<T>()`,
+  which throws when a service is missing. `AddOutbox` must therefore be
+  registered, even for saves with no buffered events.
 - [Confirmed] Library-owned save: after commit, the buffer is cleared and
   messages are enqueued. After a failure, the buffer is kept.
 - [Confirmed] Caller-owned transaction:
@@ -97,6 +105,11 @@ Each rule is labeled:
   successfully handled, and its row is deleted. This relies on Microsoft DI
   returning an empty `IEnumerable<>` for unregistered services. A container
   that returns null would throw at `EventPublisher.cs:23`.
+- [Confirmed] Subscribers publish follow-up events by injecting the
+  `DbContext` and calling `Outbox.AddEvent`. With a scoped `TContext` they share
+  the store's context (next bullet). With `AddPooledDbContextFactory` alone on
+  EF 8/9 the store creates its own context, so follow-up events added to a
+  subscriber's own context are not saved by the store.
 - [Confirmed] Subscribers run in the same DI scope as the `IOutboxStore`, so
   they share the scope's `TContext` instance. Changes a subscriber leaves
   unsaved are written by the store's `RemoveAsync` save, atomically with the

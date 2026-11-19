@@ -27,10 +27,17 @@ namespace XDev.Outbox.EFCore
         }
     }
 
+    // Event buffer: each context owns its buffer (Outbox, backed by ContextOutbox); events are persisted only by this
+    // context's saves. Pooled contexts are reused, so the buffer and every piece of per-transaction/per-save state
+    // below belong to one lease: EnsureCurrentLease (called at every save entry point, every transaction-participant
+    // member and every public buffer method) discards them when ContextId.Lease changed. Events that were never saved
+    // are therefore discarded when the context is returned to a pool (or disposed); pending messages of a caller
+    // transaction left open at the end of a lease are never dispatched (EF rolls that transaction back).
+    //
     // State machine for events saved inside a caller-owned transaction (owned saves commit and dispatch in one step).
     //
     // A save with events inside a caller transaction records one pending message per event (_pendingOutboxMessages,
-    // tied to _pendingTransactionId); its event stays in the IOutbox buffer and is not saved again in that transaction.
+    // tied to _pendingTransactionId); its event stays in the buffer and is not saved again in that transaction.
     // Pending message states:
     //   - not accepted: saved with acceptAllChangesOnSuccess = false; its business changes are still pending in the tracker.
     //   - accepted: saved with acceptAllChangesOnSuccess = true, or any later flag = true save in the transaction
@@ -71,13 +78,32 @@ namespace XDev.Outbox.EFCore
         private bool _outboxSaveInProgress;
         // > 0 while one of the SaveChanges overrides runs; savepoints EF creates and rolls back inside a save are ignored.
         private int _saveDepth;
+        // The buffer behind Outbox; internal code uses its list directly after EnsureCurrentLease.
+        private readonly ContextOutbox _outbox;
+        // ContextId.Lease the state above belongs to (always 0 for contexts that are not pooled).
+        private int _stateLease;
 
         public DbSet<OutboxMessage<TKey>> OutboxMessages { get; set; }
 
         public OutboxDbContext(DbContextOptions options)
             : base(options)
         {
+            _outbox = new ContextOutbox(EnsureCurrentLease);
         }
+
+        /// <summary>
+        /// The events to publish with this context's next save. Events added here are written to the outbox table by
+        /// this context's <c>SaveChanges</c>/<c>SaveChangesAsync</c>, in the same transaction as the business changes,
+        /// and are dispatched to subscribers after that transaction commits.
+        /// </summary>
+        /// <remarks>
+        /// The buffer belongs to this context instance (never null; the same instance for the life of the context) and
+        /// is not thread-safe, like the context. Only this context's saves persist its events: events added to another
+        /// context are not saved by this one. Events that were never saved are discarded when the context is disposed
+        /// or returned to a pool (<c>AddDbContextPool</c>, <c>AddPooledDbContextFactory</c>); a pooled context starts
+        /// every lease with an empty buffer.
+        /// </remarks>
+        public IOutbox Outbox => _outbox;
 
         protected override void OnModelCreating(ModelBuilder builder)
         {
@@ -98,6 +124,7 @@ namespace XDev.Outbox.EFCore
 
         public override int SaveChanges(bool acceptAllChangesOnSuccess)
         {
+            EnsureCurrentLease();
             _saveDepth++;
             try
             {
@@ -111,6 +138,7 @@ namespace XDev.Outbox.EFCore
 
         public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
         {
+            EnsureCurrentLease();
             _saveDepth++;
             try
             {
@@ -124,7 +152,6 @@ namespace XDev.Outbox.EFCore
 
         private int SaveChangesCore(bool acceptAllChangesOnSuccess)
         {
-            var outbox = this.GetService<IOutbox>();
             var messageQueue = this.GetService<IMessageQueue<TKey>>();
             var timeProvider = this.GetService<TimeProvider>();
 
@@ -133,7 +160,7 @@ namespace XDev.Outbox.EFCore
                 ResolvePendingMessages(QueryExistingPendingIds());
             }
 
-            var events = GetEventsToSave(outbox);
+            var events = GetEventsToSave();
             if (events.Count == 0)
             {
                 var plainResult = base.SaveChanges(acceptAllChangesOnSuccess);
@@ -183,7 +210,7 @@ namespace XDev.Outbox.EFCore
                 _outboxSaveInProgress = false;
             }
 
-            CompleteOwnedSave(outbox, acceptAllChangesOnSuccess);
+            CompleteOwnedSave(acceptAllChangesOnSuccess);
             foreach (var item in saved.Messages)
             {
                 messageQueue.EnqueueAsync(item.Message).GetAwaiter().GetResult();
@@ -194,7 +221,6 @@ namespace XDev.Outbox.EFCore
 
         private async Task<int> SaveChangesCoreAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken)
         {
-            var outbox = this.GetService<IOutbox>();
             var messageQueue = this.GetService<IMessageQueue<TKey>>();
             var timeProvider = this.GetService<TimeProvider>();
 
@@ -203,7 +229,7 @@ namespace XDev.Outbox.EFCore
                 ResolvePendingMessages(await QueryExistingPendingIdsAsync(cancellationToken));
             }
 
-            var events = GetEventsToSave(outbox);
+            var events = GetEventsToSave();
             if (events.Count == 0)
             {
                 var plainResult = await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
@@ -253,7 +279,7 @@ namespace XDev.Outbox.EFCore
                 _outboxSaveInProgress = false;
             }
 
-            CompleteOwnedSave(outbox, acceptAllChangesOnSuccess);
+            CompleteOwnedSave(acceptAllChangesOnSuccess);
             foreach (var item in saved.Messages)
             {
                 await messageQueue.EnqueueAsync(item.Message, cancellationToken);
@@ -262,10 +288,39 @@ namespace XDev.Outbox.EFCore
             return saved.Result;
         }
 
-        bool IOutboxTransactionParticipant<TKey>.IsOutboxSaveInProgress => _outboxSaveInProgress;
+        /// <summary>
+        /// A pooled context is reused across leases (<see cref="DbContextId.Lease"/> changes for every lease); the buffer
+        /// and all per-transaction/per-save state of an earlier lease are discarded at the first use in a new lease.
+        /// Pending messages of an earlier lease are never dispatched: a caller transaction left open when the context
+        /// went back to the pool is rolled back by EF, without an interceptor event. Contexts that are not pooled
+        /// keep lease 0, so this never discards anything for them.
+        /// </summary>
+        private void EnsureCurrentLease()
+        {
+            var lease = ContextId.Lease;
+            if (lease == _stateLease) return;
+
+            _stateLease = lease;
+            _outbox.Events.Clear();
+            _pendingOutboxMessages.Clear();
+            _pendingTransactionId = null;
+            _releasedNotAcceptedEvents.Clear();
+            _outboxSaveInProgress = false;
+            _saveDepth = 0;
+        }
+
+        bool IOutboxTransactionParticipant<TKey>.IsOutboxSaveInProgress
+        {
+            get
+            {
+                EnsureCurrentLease();
+                return _outboxSaveInProgress;
+            }
+        }
 
         void IOutboxTransactionParticipant<TKey>.TransactionCommitting(Guid transactionId)
         {
+            EnsureCurrentLease();
             if (!HasUnconfirmedPendingMessages(transactionId)) return;
 
             HashSet<TKey> existing;
@@ -283,6 +338,7 @@ namespace XDev.Outbox.EFCore
 
         async Task IOutboxTransactionParticipant<TKey>.TransactionCommittingAsync(Guid transactionId, CancellationToken cancellationToken)
         {
+            EnsureCurrentLease();
             if (!HasUnconfirmedPendingMessages(transactionId)) return;
 
             HashSet<TKey> existing;
@@ -300,6 +356,7 @@ namespace XDev.Outbox.EFCore
 
         IReadOnlyList<OutboxMessage<TKey>> IOutboxTransactionParticipant<TKey>.TransactionCommitted(Guid transactionId)
         {
+            EnsureCurrentLease();
             var isCurrent = _pendingTransactionId == transactionId;
             var committed = isCurrent ? _pendingOutboxMessages.ToList() : new List<SavedOutboxMessage>();
             // Only one transaction can be current per context, so messages pending for another id belong to a
@@ -316,12 +373,14 @@ namespace XDev.Outbox.EFCore
 
         void IOutboxTransactionParticipant<TKey>.EndTransactionWithoutCommit(Guid transactionId)
         {
+            EnsureCurrentLease();
             // Only one transaction can be current per context, so anything pending for another id has ended too.
             ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList(), keepUnsavedEvents: false);
         }
 
         void IOutboxTransactionParticipant<TKey>.RolledBackToSavepoint(Guid transactionId)
         {
+            EnsureCurrentLease();
             if (!ShouldCheckSavepointRollback(transactionId)) return;
 
             HashSet<TKey> existing;
@@ -339,6 +398,7 @@ namespace XDev.Outbox.EFCore
 
         async Task IOutboxTransactionParticipant<TKey>.RolledBackToSavepointAsync(Guid transactionId, CancellationToken cancellationToken)
         {
+            EnsureCurrentLease();
             if (!ShouldCheckSavepointRollback(transactionId)) return;
 
             HashSet<TKey> existing;
@@ -515,7 +575,7 @@ namespace XDev.Outbox.EFCore
         }
 
         /// <summary>
-        /// Rebuilds the <see cref="IOutbox"/> buffer, order preserved; events are matched to messages by reference and
+        /// Rebuilds the event buffer (<see cref="Outbox"/>), order preserved; events are matched to messages by reference and
         /// multiplicity. Events of <paramref name="released"/> messages (rows that will never be committed) follow the
         /// business changes they were saved with: when those changes are still pending in the tracker (saved with
         /// acceptAllChangesOnSuccess = false and not accepted by a later save) the event stays buffered and is saved
@@ -528,8 +588,8 @@ namespace XDev.Outbox.EFCore
         /// </summary>
         private void UpdateBuffer(IReadOnlyList<SavedOutboxMessage> released, IReadOnlyList<SavedOutboxMessage> committed, bool keepUnsavedEvents)
         {
-            var outbox = this.GetService<IOutbox>();
-            var buffered = outbox.GetEvents()?.ToList() ?? new List<object>();
+            var events = _outbox.Events;
+            var buffered = events.ToList();
             var unmatchedReleased = released.ToList();
             var unmatchedCommitted = committed.ToList();
             var unmatchedRemaining = _pendingOutboxMessages.Except(released).Except(committed).ToList();
@@ -586,11 +646,8 @@ namespace XDev.Outbox.EFCore
 
             if (keep.Count != buffered.Count)
             {
-                outbox.ClearEvents();
-                if (keep.Count > 0)
-                {
-                    outbox.AddEvent(keep.ToArray());
-                }
+                events.Clear();
+                events.AddRange(keep);
             }
         }
 
@@ -599,16 +656,16 @@ namespace XDev.Outbox.EFCore
         /// (disposed without commit or rollback) are released, and events already saved in the current transaction
         /// are skipped.
         /// </summary>
-        private IReadOnlyList<object> GetEventsToSave(IOutbox outbox)
+        private IReadOnlyList<object> GetEventsToSave()
         {
             if (_pendingTransactionId != null && _pendingTransactionId != Database.CurrentTransaction?.TransactionId)
             {
                 ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList(), keepUnsavedEvents: true);
             }
 
-            var events = outbox.GetEvents();
+            var events = _outbox.Events;
             ForgetReleasedEventsNotBuffered(events);
-            if (events?.Any() != true) return Array.Empty<object>();
+            if (events.Count == 0) return Array.Empty<object>();
 
             var pending = _pendingOutboxMessages.ToList();
             var toSave = new List<object>();
@@ -627,7 +684,7 @@ namespace XDev.Outbox.EFCore
 
         /// <summary>
         /// Entries of <c>_releasedNotAcceptedEvents</c> whose event the application removed from the buffer (for
-        /// example with <see cref="IOutbox.ClearEvents"/>) are forgotten, matched by reference and multiplicity, so
+        /// example with <see cref="IOutbox.ClearEvents"/> on <see cref="Outbox"/>) are forgotten, matched by reference and multiplicity, so
         /// re-adding the same instance later does not resurrect them.
         /// </summary>
         private void ForgetReleasedEventsNotBuffered(IEnumerable<object> buffered)
@@ -675,13 +732,13 @@ namespace XDev.Outbox.EFCore
             return saved.Result;
         }
 
-        private void CompleteOwnedSave(IOutbox outbox, bool acceptAllChangesOnSuccess)
+        private void CompleteOwnedSave(bool acceptAllChangesOnSuccess)
         {
             if (acceptAllChangesOnSuccess)
             {
                 ChangeTracker.AcceptAllChanges();
             }
-            outbox.ClearEvents();
+            _outbox.Events.Clear();
             // Every buffered event, including released ones, was persisted and committed by this save.
             _releasedNotAcceptedEvents.Clear();
         }

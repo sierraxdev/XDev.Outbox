@@ -17,28 +17,59 @@ run on SQLite.
 
 1. Make the consumer DbContext inherit `OutboxDbContext<TKey>`. If it overrides
    `OnModelCreating`, it must call `base.OnModelCreating`.
-2. Register the DbContext with `AddDbContext`.
-3. Call `AddOutbox(assemblies)`, which provides `IOutbox`, `IMessageQueue`, and
-   the hosted service.
+2. Register the DbContext with `AddDbContext`, `AddDbContextPool`,
+   `AddDbContextFactory` (any lifetime) or `AddPooledDbContextFactory`.
+3. Call `AddOutbox(assemblies)`, which provides `IMessageQueue` and the hosted
+   service.
 4. Call `AddEFCoreOutboxStore<TContext>()` for an int key, or
    `AddEFCoreOutboxStore<TKey, TContext>(o => o.TableName = ...)`.
+5. Add events with `dbContext.Outbox.AddEvent(...)`.
 
-Both registrations are required. Every save resolves `IOutbox`,
-`IMessageQueue<TKey>`, and `TimeProvider` through `this.GetService<T>()`, which
-throws if a service is missing. The transaction interceptor also depends on
-`IMessageQueue<TKey>`.
+### Event buffer (since 2026-11-19, decision 002)
 
-`AddEFCoreOutboxStore` adds the interceptor to the DbContext options. The
-mechanism depends on the target framework:
+- Each `OutboxDbContext` instance owns its buffer: `Outbox` (type `IOutbox`,
+  internal `ContextOutbox`). `IOutbox` is no longer registered in DI and the
+  `Outbox` class was removed; code that injects `IOutbox` fails at resolution.
+- Only saves on that context persist its events. Another context in the same
+  scope does not. Unsaved events are discarded when the context is disposed or
+  returned to its pool.
+- **Per-lease reset.** `EnsureCurrentLease()` compares `DbContext.ContextId.Lease`
+  (0 for non-pooled, incremented on every pool lease; pinned by tests on EF
+  8–11) and, on change, clears the buffer and all pending/transaction state.
+  It runs first in both save overrides, every `IOutboxTransactionParticipant`
+  member (including the `IsOutboxSaveInProgress` getter) and every buffer
+  method. EF's pool reset raises no transaction interceptor event, so cleanup
+  cannot rely on `EndTransactionWithoutCommit`. Tests showed the buffer clear
+  is load-bearing; clearing pending state is defense in depth (stale pending
+  ids never match a new transaction).
+- A stale reference to a context after its lease ended still accepts
+  `Outbox.AddEvent`; the event is discarded at the next lease (misuse, as with
+  any `DbContext`).
 
-- **net9.0+**: uses `services.ConfigureDbContext<TContext>(...)`.
-- **net8.0**:
-  - `DbContextOptions<TContext>` must already be registered, or the call
-    throws.
-  - It builds a temporary service provider, which is never disposed, and
-    replaces the options with a scoped factory.
-  - The consumer's options lambda therefore runs once, and options that depend
-    on scoped services are frozen. This is a known defect and was not fixed.
+The remaining `GetService<T>()` calls resolve singletons only
+(`IMessageQueue<TKey>`, `TimeProvider`, options), so resolving them from the
+root provider of pooled or factory contexts is valid. They throw if
+`AddOutbox`/`AddEFCoreOutboxStore` were not called.
+
+### Interceptor registration
+
+`AddEFCoreOutboxStore` adds the singleton interceptor to the DbContext options,
+at most once per options instance (reference check), so calling it twice is
+harmless. A second, consumer-created interceptor instance is attached too but
+causes no double dispatch.
+
+- **net9.0+**: `services.ConfigureDbContext<TContext>(...)`. Works for every
+  registration kind; ordering relative to the DbContext registration does not
+  matter.
+- **net8.0**: wraps the last non-keyed `DbContextOptions<TContext>` descriptor
+  in place, keeping its lifetime (scoped for `AddDbContext`, singleton for
+  pools and default factories). The consumer's options action runs on every
+  resolution with the real provider. The DbContext must be registered first,
+  or the call throws. (Before 2026-11-19 it built a temporary provider and
+  replaced the options with a frozen scoped snapshot: finding #6.)
+
+Hand-built options need `UseApplicationServiceProvider(sp)` and
+`AddInterceptors(sp.GetRequiredService<OutboxDispatchTransactionInterceptor<TKey>>())`.
 
 ## Save Path
 
@@ -183,12 +214,20 @@ It delegates to the context through the internal
 - failed, with action `Commit` or `Rollback`;
 - rolled back to savepoint.
 
-For contexts that are not participants, it only clears the buffer on commit
-or rollback.
+Contexts that are not participants (plain `DbContext`) are ignored.
 
 ## EntityFrameworkOutboxStore
 
-This store is scoped and uses the scope's `TContext`.
+This store is scoped. It uses the scope's `TContext` if one is registered;
+otherwise it creates one from `IDbContextFactory<TContext>`, owns it, and
+disposes it with the scope (`IDisposable`/`IAsyncDisposable`); otherwise its
+constructor throws naming the registration methods.
+
+- `AddPooledDbContextFactory` registers a scoped `TContext` only on EF 10+. On
+  EF 8/9 with the pooled factory alone, the store uses its own context, so a
+  subscriber's context is not the store's: follow-up events a subscriber adds
+  to its own context are **not** saved by `RemoveAsync` (silently). Pinned by
+  `ProcessorScope_PooledFactoryOnly_DocumentsWhetherTheSubscriberSharesTheStoresContext`.
 
 - `GetAllAsync` runs the claim query with `AsNoTracking`.
 - `RemoveAsync` and `UpdateAsync` call `SaveChangesAsync`. With no buffered
@@ -212,7 +251,8 @@ This store is scoped and uses the scope's `TContext`.
 - **Duplicate events.** The same event instance added twice is persisted and
   dispatched twice.
 - **Dependency on EF internals.** Correctness depends on undocumented EF
-  change-tracker behavior; see `.ai/decisions/001-deferred-acceptance-and-payload-projection.md`.
+  change-tracker behavior (see `.ai/decisions/001-deferred-acceptance-and-payload-projection.md`)
+  and on `ContextId.Lease` incrementing per pool lease (decision 002).
 - **Not verified on SQL Server.** The tests run on SQLite only. Unverified on
   SQL Server: identity on retry, savepoint SQL, payload UPDATE parameter typing
   (reviewer N5), and `OUTPUT` batching.
@@ -224,8 +264,11 @@ This store is scoped and uses the scope's `TContext`.
 - **Design-time factory.** The sample's `DesignTimeApplicationDbContextFactory`
   calls `AddEFCoreOutboxStore` without `AddOutbox`. On net9+, `dotnet ef`
   design-time creation will likely fail.
-- **Pooled and factory-created contexts.** With `IDbContextFactory` or pooling,
-  `IOutbox` may resolve from the root provider. Pending state is not reset on
-  pool return; it is released harmlessly on the next lease.
-- **Unused interceptor.** `OutboxInterceptor<TKey>` is registered but never
-  attached. Adding it manually would double-insert messages.
+- **Subscriber buffers then throws.** A subscriber that adds events to the
+  shared scoped context and then throws has those events (and its partial
+  changes) persisted by `store.UpdateAsync`'s save. Same as before the
+  2026-11-19 change.
+
+(Resolved 2026-11-19: pooled/factory contexts reading the root-provider
+`IOutbox`, pending state leaking across pool leases, and the unused
+`OutboxInterceptor<TKey>`, which was deleted.)

@@ -2,7 +2,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using XDev.Outbox;
 
 namespace Example
 {
@@ -33,7 +32,6 @@ namespace Example
                 var scopedServices = scope.ServiceProvider;
                 var dbContext = scopedServices.GetRequiredService<ApplicationDbContext>();
                 var dbContextFactory = scopedServices.GetService<IDbContextFactory<ApplicationDbContext>>();
-                var outbox = scopedServices.GetRequiredService<IOutbox>();
 
                 try
                 {
@@ -56,7 +54,7 @@ namespace Example
                                         CreatedDate = DateTime.UtcNow,
                                     };
                                     context.Users.Add(newUser);
-                                    outbox.AddEvent(new UserCreatedEvent
+                                    context.Outbox.AddEvent(new UserCreatedEvent
                                     {
                                         User = newUser
                                     });
@@ -76,7 +74,6 @@ namespace Example
                                 {
                                     await using var scopeStrategy = _serviceScopeFactory.CreateAsyncScope();
                                     var context = scopeStrategy.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-                                    var outboxStrategy = scopeStrategy.ServiceProvider.GetRequiredService<IOutbox>();
 
                                     await using var contextTransaction = await context.Database.BeginTransactionAsync(stoppingToken);
 
@@ -86,7 +83,7 @@ namespace Example
                                         CreatedDate = DateTime.UtcNow,
                                     };
                                     context.Users.Add(newUser);
-                                    outboxStrategy.AddEvent(new UserCreatedEvent
+                                    context.Outbox.AddEvent(new UserCreatedEvent
                                     {
                                         User = newUser
                                     });
@@ -106,7 +103,7 @@ namespace Example
                             else
                             {
                                 dbContext.ChangeTracker.Clear();
-                                outbox.ClearEvents();
+                                dbContext.Outbox.ClearEvents();
 
                                 await using var contextTransaction = await dbContext.Database.BeginTransactionAsync(stoppingToken);
 
@@ -116,7 +113,7 @@ namespace Example
                                     CreatedDate = DateTime.UtcNow,
                                 };
                                 dbContext.Users.Add(newUser);
-                                outbox.AddEvent(new UserCreatedEvent
+                                dbContext.Outbox.AddEvent(new UserCreatedEvent
                                 {
                                     User = newUser
                                 });
@@ -142,7 +139,7 @@ namespace Example
                             CreatedDate = DateTime.UtcNow,
                         };
                         dbContext.Users.Add(newUser);
-                        outbox.AddEvent(new UserCreatedEvent
+                        dbContext.Outbox.AddEvent(new UserCreatedEvent
                         {
                             User = newUser
                         });

@@ -240,7 +240,7 @@ public sealed class RecordingQueue<TKey> : IMessageQueue<TKey> where TKey : stru
 
 /// <summary>Isolated SQLite in-memory host for an arbitrary outbox context and key type.</summary>
 public sealed class AdvHost<TContext, TKey> : IDisposable
-    where TContext : DbContext, IOutboxDbContext<TKey>
+    where TContext : OutboxDbContext<TKey>
     where TKey : struct
 {
     private readonly string _outboxTable;
@@ -288,7 +288,8 @@ public sealed class AdvHost<TContext, TKey> : IDisposable
     public (IServiceScope Scope, TContext Db, IOutbox Outbox) CreateScope()
     {
         var scope = Services.CreateScope();
-        return (scope, scope.ServiceProvider.GetRequiredService<TContext>(), scope.ServiceProvider.GetRequiredService<IOutbox>());
+        var db = scope.ServiceProvider.GetRequiredService<TContext>();
+        return (scope, db, db.Outbox);
     }
 
     public long Scalar(string sql)

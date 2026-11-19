@@ -269,7 +269,8 @@ public sealed class R2Host : IDisposable
     public (IServiceScope Scope, R2DbContext Db, IOutbox Outbox) CreateScope()
     {
         var scope = Services.CreateScope();
-        return (scope, scope.ServiceProvider.GetRequiredService<R2DbContext>(), scope.ServiceProvider.GetRequiredService<IOutbox>());
+        var db = scope.ServiceProvider.GetRequiredService<R2DbContext>();
+        return (scope, db, db.Outbox);
     }
 
     public long Scalar(string sql)

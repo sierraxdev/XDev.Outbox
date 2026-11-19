@@ -51,7 +51,6 @@ namespace Microsoft.Extensions.DependencyInjection
                     services.TryAddEnumerable(ServiceDescriptor.Scoped(findInterface, subscriber));
 
             services.TryAddScoped<IEventPublisher, EventPublisher>();
-            services.TryAddScoped<IOutbox, Outbox>();
             services.TryAddSingleton<IMessageQueue<TKey>, MemoryMessageQueue<TKey>>();
             services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, OutboxProcessorHostedService<TKey>>());
             services.TryAddSingleton(TimeProvider.System);
@@ -97,7 +96,6 @@ namespace Microsoft.Extensions.DependencyInjection
                     services.TryAddEnumerable(ServiceDescriptor.Scoped(findInterface, subscriber));
 
             services.TryAddScoped<IEventPublisher, EventPublisher>();
-            services.TryAddScoped<IOutbox, Outbox>();
             services.TryAddSingleton<IMessageQueue<TKey>, MemoryMessageQueue<TKey>>();
             services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, OutboxProcessorHostedService<TKey>>());
 

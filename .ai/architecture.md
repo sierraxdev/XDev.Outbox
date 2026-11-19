@@ -4,7 +4,7 @@
 
 The system is an in-process transactional outbox:
 
-1. Application code buffers events in the scoped `IOutbox`.
+1. Application code buffers events on its DbContext (`dbContext.Outbox`).
 2. Any `OutboxDbContext<TKey>` save overload writes business changes and
    outbox rows in one database transaction.
 3. After commit, the just-written messages are enqueued to a singleton
@@ -24,7 +24,7 @@ broker is used by the shipped components.
 
 | Component | Project | Responsibility |
 |---|---|---|
-| `IOutbox` / `Outbox` (scoped) | XDev.Outbox | Per-scope event buffer. |
+| `IOutbox` (implemented by `OutboxDbContext.Outbox`) | XDev.Outbox / XDev.Outbox.EFCore | Per-context event buffer, reset per pool lease. |
 | `ISubscriber<T>` | XDev.Outbox | Consumer handler contract. |
 | `EventPublisher` (scoped) | XDev.Outbox | Resolves and invokes subscribers for an event's runtime type. |
 | `IMessageQueue<TKey>` / `MemoryMessageQueue` (singleton) | XDev.Outbox | In-memory queue with bounded concurrent handling. |
@@ -54,7 +54,7 @@ Component details are in `components/outbox-dispatch-runtime.md` and
 
 ### Write flow (application request)
 
-`IOutbox.AddEvent(evt)` adds to the buffer. Then any save overload runs. The
+`dbContext.Outbox.AddEvent(evt)` adds to the context's buffer. Then any save overload runs. The
 logic lives in `SaveChanges(bool)` and `SaveChangesAsync(bool, ct)`:
 
 - **No buffered events:** it passes through to the base save.
@@ -149,11 +149,10 @@ unknown unless stated.
   (`tests/XDev.Outbox.Tests`). The queue, the SQL Server claim query, and the
   hosted service have no tests.
 - The save path is a large state machine (about 1,100 lines) that depends on
-  undocumented EF change-tracker internals. See
-  `decisions/001-deferred-acceptance-and-payload-projection.md`.
-- `OutboxInterceptor<TKey>` (a `SaveChangesInterceptor`) is registered as a DI
-  singleton but is never added to any DbContext. It appears superseded by the
-  `OutboxDbContext` save override plus `OutboxDispatchTransactionInterceptor`.
+  undocumented EF change-tracker internals, plus `ContextId.Lease` for the
+  per-lease reset of pooled contexts. See
+  `decisions/001-deferred-acceptance-and-payload-projection.md` and
+  `decisions/002-event-buffer-on-dbcontext.md`.
 - The store is SQL Server-specific although the package is described as EF
   Core-generic.
 - The poll interval (30 min), batch size (100), error back-off (5 min), default

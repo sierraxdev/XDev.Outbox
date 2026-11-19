@@ -6,7 +6,8 @@ XDev.Outbox is a set of .NET class libraries (published to NuGet as
 `XDev.Outbox` and `XDev.Outbox.EFCore`) that implement the transactional
 outbox pattern for applications using Entity Framework Core.
 
-An application records events in a scoped buffer (`IOutbox.AddEvent`). When
+An application records events in its DbContext's buffer
+(`dbContext.Outbox.AddEvent`). When
 the application saves its EF Core `DbContext`, the events are written to an
 outbox table in the same database transaction as the business data. After the
 transaction commits, the events are dispatched to in-process subscribers
@@ -40,7 +41,8 @@ library gives to consuming applications.
   `MemoryMessageQueue`, `EventPublisher`, `OutboxProcessorHostedService`, and
   `AddOutbox(...)` DI registration.
 - `src/XDev.Outbox.EFCore/` holds the EF Core / SQL Server store:
-  `OutboxDbContext<TKey>`, `EntityFrameworkOutboxStore`,
+  `OutboxDbContext<TKey>` (with the `Outbox` event buffer),
+  `EntityFrameworkOutboxStore`,
   `OutboxDispatchTransactionInterceptor`, `OutboxMessageConfiguration`, and
   `AddEFCoreOutboxStore<...>()`.
 - `src/XDev.Outbox.ServiceBus/` holds an incomplete Azure Service Bus queue
@@ -58,9 +60,10 @@ net8 to net11) covers subscriber registration (`AddOutbox`) and
 
 ## Domain Terminology
 
-- **Event**: any CLR object passed to `IOutbox.AddEvent`. Its runtime type
+- **Event**: any CLR object passed to `dbContext.Outbox.AddEvent`. Its runtime type
   selects the subscribers.
-- **Outbox (buffer)**: the scoped, in-memory `IOutbox` list of events pending
+- **Outbox (buffer)**: the per-context, in-memory `OutboxDbContext.Outbox`
+  (`IOutbox`) list of events pending
   for the current DI scope / `DbContext`.
 - **Outbox message**: a persisted `OutboxMessage<TKey>` row holding the event
   type name, JSON payload, attempt count, and lock expiry.
@@ -118,8 +121,9 @@ dotnet test tests/XDev.Outbox.EFCore.Tests -f net11.0
 Run all four target frameworks; EF behavior differs by version.
 
 - The tests use SQLite in-memory, so SQL Server is not needed.
-- On 2026-11-18 each framework reported 389 tests: 388 passed and 1 skipped.
-  The skipped test is the deferred D5 limitation.
+- On 2026-11-19 the EFCore suite reported 588 tests on net8.0 (587 passed)
+  and 587 on net9.0–net11.0 (586 passed), 1 skipped on each: the deferred D5
+  limitation.
 - Also run `dotnet test tests/XDev.Outbox.Tests -f <tfm>` for the same four
   frameworks. On 2026-11-19 each reported 11 passed.
 - Core runtime coverage is limited to subscriber registration and

@@ -1,6 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
-using Microsoft.EntityFrameworkCore.Infrastructure;
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
@@ -21,9 +20,12 @@ namespace XDev.Outbox.EFCore
     /// commit proceeds, the affected messages are left to the outbox poller and a warning is logged under
     /// <c>Microsoft.EntityFrameworkCore.Database.Transaction</c> with event id 41001
     /// (<c>XDev.Outbox.EFCore.UnconfirmedPendingMessagesAtCommit</c>).
-    /// The buffer itself is updated by the context (<see cref="IOutboxTransactionParticipant{TKey}"/>) for every outcome.
+    /// The buffer itself (<see cref="OutboxDbContext{TKey, TContext}.Outbox"/>) is updated by the context
+    /// (<see cref="IOutboxTransactionParticipant{TKey}"/>) for every outcome.
     /// Failures of other actions (savepoints) do not end the transaction and are ignored.
     /// Transactions owned by <see cref="OutboxDbContext{TKey, TContext}"/> dispatch their own messages and are ignored here.
+    /// Transactions of contexts that do not derive from <see cref="OutboxDbContext{TKey, TContext}"/> are ignored: such
+    /// a context has no event buffer.
     /// </summary>
     public sealed class OutboxDispatchTransactionInterceptor<TKey> : DbTransactionInterceptor where TKey : struct
     {
@@ -128,22 +130,15 @@ namespace XDev.Outbox.EFCore
                     : participant.TransactionCommitted(eventData.TransactionId);
             }
 
-            context.GetService<IOutbox>().ClearEvents();
             return Array.Empty<OutboxMessage<TKey>>();
         }
 
         private static void Discard(DbContext context, Guid transactionId)
         {
-            if (context == null) return;
-
-            if (context is IOutboxTransactionParticipant<TKey> participant)
+            if (context is IOutboxTransactionParticipant<TKey> participant && !participant.IsOutboxSaveInProgress)
             {
-                if (participant.IsOutboxSaveInProgress) return;
                 participant.EndTransactionWithoutCommit(transactionId);
-                return;
             }
-
-            context.GetService<IOutbox>().ClearEvents();
         }
 
         private static bool EndsTransaction(TransactionErrorEventData eventData) =>

@@ -165,7 +165,7 @@ public sealed class TestScope : IDisposable
     {
         _scope = scope;
         Db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
-        Outbox = scope.ServiceProvider.GetRequiredService<IOutbox>();
+        Outbox = Db.Outbox;
     }
 
     public IServiceProvider Services => _scope.ServiceProvider;

@@ -1,8 +1,8 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using System;
-using System.Collections.Generic;
 using System.Linq;
 using XDev.Outbox;
 using XDev.Outbox.EFCore;
@@ -20,47 +20,67 @@ namespace Microsoft.Extensions.DependencyInjection
                 services.AddOptions<OutboxDbContextConfiguration>().Configure<IServiceProvider>((options, sp) => configuration?.Invoke(options));
             }
 
-            services.TryAddSingleton<OutboxInterceptor<TKey>>();
             services.TryAddScoped<IOutboxStore<TKey>, EntityFrameworkOutboxStore<TKey, TContext>>();
             services.TryAddSingleton(TimeProvider.System);
             services.TryAddSingleton<OutboxDispatchTransactionInterceptor<TKey>>();
 
 #if NET9_0_OR_GREATER
             services.ConfigureDbContext<TContext>((sp, options) =>
-                options.AddInterceptors(sp.GetRequiredService<OutboxDispatchTransactionInterceptor<TKey>>()));
+            {
+                var interceptor = sp.GetRequiredService<OutboxDispatchTransactionInterceptor<TKey>>();
+                if (!HasInterceptor(options.Options, interceptor))
+                {
+                    options.AddInterceptors(interceptor);
+                }
+            });
 
 #else
-            var contextOptions = services.FirstOrDefault(x => x.ServiceType == typeof(DbContextOptions<TContext>));
-            if (contextOptions == null)
+            // The registered options are wrapped in place, keeping their lifetime (singleton for pooling and default
+            // factories, scoped for AddDbContext), so the consumer's options action still runs on every resolution.
+            var index = -1;
+            for (var i = services.Count - 1; i >= 0; i--)
             {
-                throw new InvalidOperationException($"No service of type '{typeof(DbContextOptions<TContext>)}' found. Ensure that the DbContext '{typeof(TContext).Name}' is registered before calling 'AddEFCoreOutboxStore'.");
+                // Reading the implementation of a keyed descriptor throws, so keyed registrations are skipped.
+                if (services[i].ServiceType == typeof(DbContextOptions<TContext>) && !services[i].IsKeyedService)
+                {
+                    index = i;
+                    break;
+                }
             }
-            var dbContextOptions = services.BuildServiceProvider().GetService<DbContextOptions<TContext>>();
-            services.Replace(new ServiceDescriptor(
-                    typeof(DbContextOptions<TContext>),
-                    p => CreateDbContextOptions(p, dbContextOptions, (sp, options) =>
-                                options.AddInterceptors(sp.GetRequiredService<OutboxDispatchTransactionInterceptor<TKey>>())),
-                    ServiceLifetime.Scoped));
+            if (index < 0)
+            {
+                throw new InvalidOperationException($"No service of type '{typeof(DbContextOptions<TContext>)}' is registered. Register the DbContext '{typeof(TContext).Name}' with AddDbContext, AddDbContextPool, AddDbContextFactory or AddPooledDbContextFactory before calling AddEFCoreOutboxStore.");
+            }
+
+            var original = services[index];
+            services[index] = new ServiceDescriptor(
+                typeof(DbContextOptions<TContext>),
+                sp => AddInterceptor(
+                    (DbContextOptions<TContext>)CreateOriginalInstance(sp, original),
+                    sp.GetRequiredService<OutboxDispatchTransactionInterceptor<TKey>>()),
+                original.Lifetime);
 #endif
 
             return services;
         }
 
+        private static bool HasInterceptor(DbContextOptions options, IInterceptor interceptor)
+            => options.FindExtension<CoreOptionsExtension>()?.Interceptors?.Any(x => ReferenceEquals(x, interceptor)) == true;
+
 #if !NET9_0_OR_GREATER
-        private static DbContextOptions<TContext> CreateDbContextOptions<TContext>(
-            IServiceProvider applicationServiceProvider,
-            DbContextOptions<TContext>? baseOptions,
-            Action<IServiceProvider, DbContextOptionsBuilder>? optionsAction)
+        private static DbContextOptions<TContext> AddInterceptor<TContext>(DbContextOptions<TContext> options, IInterceptor interceptor)
             where TContext : DbContext
         {
-            var builder = new DbContextOptionsBuilder<TContext>(
-                baseOptions ?? new DbContextOptions<TContext>(new Dictionary<Type, IDbContextOptionsExtension>()));
+            return HasInterceptor(options, interceptor)
+                ? options
+                : new DbContextOptionsBuilder<TContext>(options).AddInterceptors(interceptor).Options;
+        }
 
-            builder.UseApplicationServiceProvider(applicationServiceProvider);
-
-            optionsAction?.Invoke(applicationServiceProvider, builder);
-
-            return builder.Options;
+        private static object CreateOriginalInstance(IServiceProvider serviceProvider, ServiceDescriptor descriptor)
+        {
+            if (descriptor.ImplementationInstance != null) return descriptor.ImplementationInstance;
+            if (descriptor.ImplementationFactory != null) return descriptor.ImplementationFactory(serviceProvider);
+            return ActivatorUtilities.CreateInstance(serviceProvider, descriptor.ImplementationType!);
         }
 #endif
     }

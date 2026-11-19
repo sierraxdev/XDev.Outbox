@@ -10,14 +10,12 @@ namespace Example
         protected readonly IServiceProvider _serviceProvider;
         private readonly ILogger _logger;
         protected readonly ApplicationDbContext _applicationDbContext;
-        private readonly IOutbox _outbox;
         public UserCreatedEventHandler(IServiceProvider serviceProvider, ILogger<UserCreatedEventHandler> logger,
-            ApplicationDbContext applicationDbContext, IOutbox outbox)
+            ApplicationDbContext applicationDbContext)
         {
             _serviceProvider = serviceProvider;
             _logger = logger;
             _applicationDbContext = applicationDbContext;
-            _outbox = outbox;
         }
 
         public async Task HandleEventAsync(UserCreatedEvent eventMessage, CancellationToken cancellationToken = default)
@@ -27,7 +25,7 @@ namespace Example
             if (user != null)
             {
                 user.ModifiedDate = DateTime.UtcNow;
-                _outbox.AddEvent(new UserUpdatedEvent { Id = user.Id });
+                _applicationDbContext.Outbox.AddEvent(new UserUpdatedEvent { Id = user.Id });
                 await _applicationDbContext.SaveChangesAsync(cancellationToken);
             }
         }

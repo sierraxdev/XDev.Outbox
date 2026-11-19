@@ -10,14 +10,35 @@ using System.Threading.Tasks;
 
 namespace XDev.Outbox.EFCore
 {
-    public class EntityFrameworkOutboxStore<TKey, TContext> : IOutboxStore<TKey> where TKey : struct where TContext : DbContext, IOutboxDbContext<TKey>
+    /// <summary>
+    /// Outbox store backed by <typeparamref name="TContext"/>. Registered as a scoped service. It uses the scope's
+    /// <typeparamref name="TContext"/> when one is registered (<c>AddDbContext</c>, <c>AddDbContextPool</c>,
+    /// <c>AddDbContextFactory</c>); otherwise it creates a context from <see cref="IDbContextFactory{TContext}"/>
+    /// (for example with <c>AddPooledDbContextFactory</c> alone) and disposes it with the scope.
+    /// </summary>
+    public class EntityFrameworkOutboxStore<TKey, TContext> : IOutboxStore<TKey>, IDisposable, IAsyncDisposable where TKey : struct where TContext : DbContext, IOutboxDbContext<TKey>
     {
         private readonly TContext _dbContext;
         private readonly TimeProvider _timeProvider;
+        // True when the context was created from IDbContextFactory<TContext>: the store disposes it.
+        private readonly bool _ownsDbContext;
+        private bool _disposed;
 
         public EntityFrameworkOutboxStore(IServiceProvider serviceProvider, TimeProvider timeProvider)
         {
-            _dbContext = serviceProvider.GetRequiredService<TContext>();
+            var dbContext = serviceProvider.GetService<TContext>();
+            if (dbContext == null)
+            {
+                var factory = serviceProvider.GetService<IDbContextFactory<TContext>>();
+                if (factory == null)
+                {
+                    throw new InvalidOperationException($"The outbox store cannot obtain a '{typeof(TContext).Name}': neither '{typeof(TContext)}' nor '{typeof(IDbContextFactory<TContext>)}' is registered. Register the DbContext with AddDbContext, AddDbContextPool, AddDbContextFactory or AddPooledDbContextFactory.");
+                }
+                dbContext = factory.CreateDbContext();
+                _ownsDbContext = true;
+            }
+
+            _dbContext = dbContext;
             _timeProvider = timeProvider;
         }
 
@@ -95,6 +116,25 @@ namespace XDev.Outbox.EFCore
         {
             _dbContext.OutboxMessages.Update(message);
             return _dbContext.SaveChangesAsync(cancellationToken);
+        }
+
+        /// <summary>Disposes the context when the store created it from the factory; a scope's context is left to the scope.</summary>
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            if (_ownsDbContext)
+            {
+                _dbContext.Dispose();
+            }
+        }
+
+        /// <inheritdoc cref="Dispose"/>
+        public ValueTask DisposeAsync()
+        {
+            if (_disposed) return default;
+            _disposed = true;
+            return _ownsDbContext ? _dbContext.DisposeAsync() : default;
         }
     }
 }
