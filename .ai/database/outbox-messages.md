@@ -55,7 +55,7 @@ No indexes beyond the PK are defined.
 
   ```sql
   ;WITH cte AS (
-      SELECT TOP (@take) * FROM <schema>.<table> WITH (ROWLOCK, READPAST, UPDLOCK)
+      SELECT TOP (@take) * FROM [<schema>].[<table>] WITH (ROWLOCK, READPAST, UPDLOCK)
       WHERE (Attemps IS NULL OR Attemps < @maxAttemps)
         AND (LockExpiresAt IS NULL OR LockExpiresAt < @dateTimeNow)
       ORDER BY Id)
@@ -91,11 +91,29 @@ No indexes beyond the PK are defined.
 - The raw SQL uses T-SQL table hints, `TOP`, and `OUTPUT INSERTED.*`, and
   passes `Microsoft.Data.SqlClient.SqlParameter`. Other providers are not
   supported by `EntityFrameworkOutboxStore`.
-- The schema in the raw SQL is `entityType.GetDefaultSchema() ?? "dbo"`.
-  `GetDefaultSchema()` is the model default schema. [Observed, intent unknown]
-  If the table lives in a non-`dbo` schema without a model-level
-  `HasDefaultSchema`, the raw SQL could target the wrong table. This has not
-  been verified at runtime.
+- **Claim table name (fixed 2026-11-19).** The claim SQL uses the table's
+  own schema (`ToTable(name, schema)`), falling back to `HasDefaultSchema`,
+  and is unqualified when none is set, so it resolves through the connection
+  user's default schema exactly like EF's own INSERT/UPDATE/DELETE. The name is
+  delimited with `ISqlGenerationHelper` and brace-escaped (internal
+  `OutboxSqlText`), so `{`, `}`, `]`, quotes, spaces, unicode and 128-char
+  identifiers work. Before, it used `GetDefaultSchema() ?? "dbo"` undelimited:
+  error 208 or claiming a `dbo` table of the same name, and `FormatException`
+  on braces. Any identifier passed to `FromSqlRaw`/`ExecuteSqlRaw` must be
+  brace-escaped.
+- The public `GetTableNameWithScheme<T>()` now returns the table's schema
+  (falling back to model default, then `dbo`), undelimited. The library no
+  longer uses it; it can disagree with the claim when no schema is set and
+  the login's default schema is not `dbo`.
+- **Known limitation.** The claim SQL hard-codes undelimited column names
+  (`Id`, `Attemps`, `LockExpiresAt`); renaming them (`HasColumnName`, naming
+  conventions) breaks the claim while saves keep working.
+- **Defect (open, pre-existing).** `GetAllAsync(itemsCount: null)` fails on
+  SQL Server with error 1033: the CTE keeps `ORDER BY Id` but emits
+  `TOP (@take)` only when `itemsCount` has a value. The hosted poller always
+  passes a count, so it is unaffected; direct callers using the default are.
+- `@dateTimeNow` and `@lockExpiration` are sent as SQL `datetime`, so stored
+  lock times are rounded to about 3 ms.
 - Times are written as `TimeProvider.GetUtcNow().DateTime`, which is a UTC
   value with `DateTimeKind.Unspecified`.
 

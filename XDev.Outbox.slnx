@@ -11,6 +11,7 @@
     <Project Path="src/XDev.Outbox/XDev.Outbox.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/XDev.Outbox.EFCore.SqlServer.Tests/XDev.Outbox.EFCore.SqlServer.Tests.csproj" />
     <Project Path="tests/XDev.Outbox.EFCore.Tests/XDev.Outbox.EFCore.Tests.csproj" />
     <Project Path="tests/XDev.Outbox.Tests/XDev.Outbox.Tests.csproj" />
   </Folder>

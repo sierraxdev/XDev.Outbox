@@ -98,4 +98,5 @@ Two findings from EF Core source and tests, confirmed on EF 8–11:
 
 - `tests/XDev.Outbox.EFCore.Tests` (389 tests) must pass on net8, net9, net10
   and net11. The only accepted skip is the D5 test.
-- Not yet verified on SQL Server. A SQL Server smoke suite is recommended.
+- Verified on SQL Server LocalDB on 2026-11-19
+  (`tests/XDev.Outbox.EFCore.SqlServer.Tests`); D5 reproduces there.

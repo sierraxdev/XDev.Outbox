@@ -132,7 +132,17 @@ Run all four target frameworks; EF behavior differs by version.
 
 ### Integration Tests
 
-None exist. The only runtime verification is to run `samples/Example`
+```
+dotnet test tests/XDev.Outbox.EFCore.SqlServer.Tests -f <tfm>
+```
+
+SQL Server smoke suite (net8–net11). Defaults to LocalDB
+`(localdb)\MSSQLLocalDB`; `XDEV_OUTBOX_SQLSERVER` overrides the base
+connection string. Tests skip when the server is unreachable. Each class
+creates and drops a `XDevOutboxSmoke_<guid>` database. On 2026-11-19 each
+TFM reported 113 tests: 108 passed, 5 skipped (D5 and 4 confirmed defects).
+
+The sample can also be run manually: `samples/Example`
 (`dotnet run --project samples/Example -- --console`) against SQL Server
 LocalDB (`(localdb)\MSSQLLocalDB`, database `OutboxExample`), after applying
 the sample's EF migrations.

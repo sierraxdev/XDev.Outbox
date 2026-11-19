@@ -253,9 +253,17 @@ constructor throws naming the registration methods.
 - **Dependency on EF internals.** Correctness depends on undocumented EF
   change-tracker behavior (see `.ai/decisions/001-deferred-acceptance-and-payload-projection.md`)
   and on `ContextId.Lease` incrementing per pool lease (decision 002).
-- **Not verified on SQL Server.** The tests run on SQLite only. Unverified on
-  SQL Server: identity on retry, savepoint SQL, payload UPDATE parameter typing
-  (reviewer N5), and `OUTPUT` batching.
+- **SQL Server (verified 2026-11-19, LocalDB 17.0, net8–net11,
+  `tests/XDev.Outbox.EFCore.SqlServer.Tests`).** Confirmed: identity values on
+  execution-strategy and application retries (no FK errors, final ids in
+  payloads), EF's per-save `SAVE TRANSACTION` in caller transactions, the
+  savepoint existence query, `OUTPUT`/MERGE batching, pooled contexts, the
+  net8 options path, and Guid keys. Payload parameters are `nvarchar(4000)`
+  up to 4000 chars and `nvarchar(max)` above, with no implicit conversion;
+  large and non-ASCII payloads round-trip exactly. The payload UPDATE is one
+  round trip per message. D5 reproduces. Not covered: real transient
+  `SqlException`s, commit-unknown outcomes, MARS, Azure SQL, factory
+  registrations on SQL Server.
 - **`TransactionScope` and InMemory.** These are unsupported on every overload:
   the save path requires relational transactions.
 

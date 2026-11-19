@@ -79,4 +79,5 @@ Reproduced on EF 8–11:
 `ContextIsolationAdversarialTests`, `OptionsRegistrationAdversarialTests`.
 Mutation checks: disabling the lease reset fails 80 tests; restoring the old
 net8 registration fails 40 on net8; removing the interceptor guard fails 9.
-Not verified on SQL Server.
+Pooled contexts and the net8 options path were verified on SQL Server LocalDB
+(2026-11-19); factory registrations were not run there.
