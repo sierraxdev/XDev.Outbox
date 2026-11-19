@@ -48,7 +48,7 @@ namespace Microsoft.Extensions.DependencyInjection
                     var isMatch = type.IsGenericType && ((Type)criteria).IsAssignableFrom(type.GetGenericTypeDefinition());
                     return isMatch;
                 }, typeof(ISubscriber<>)))
-                    services.TryAddScoped(findInterface, subscriber);
+                    services.TryAddEnumerable(ServiceDescriptor.Scoped(findInterface, subscriber));
 
             services.TryAddScoped<IEventPublisher, EventPublisher>();
             services.TryAddScoped<IOutbox, Outbox>();
@@ -94,7 +94,7 @@ namespace Microsoft.Extensions.DependencyInjection
                     var isMatch = type.IsGenericType && ((Type)criteria).IsAssignableFrom(type.GetGenericTypeDefinition());
                     return isMatch;
                 }, typeof(ISubscriber<>)))
-                    services.TryAddScoped(findInterface, subscriber);
+                    services.TryAddEnumerable(ServiceDescriptor.Scoped(findInterface, subscriber));
 
             services.TryAddScoped<IEventPublisher, EventPublisher>();
             services.TryAddScoped<IOutbox, Outbox>();

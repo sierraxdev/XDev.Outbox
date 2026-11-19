@@ -64,20 +64,35 @@ Each rule is labeled:
 
 - [Confirmed] Subscribers are discovered by scanning the assemblies passed to
   `AddOutbox(...)`. At least one assembly is required.
-- [Confirmed] Each discovered closed `ISubscriber<X>` is registered with
-  `TryAddScoped`. **Only the first discovered implementation per event type is
-  registered.** Additional subscribers for the same event type are silently
-  ignored, as is any implementation registered after an existing
-  registration. [Observed, intent unknown] `EventPublisher` enumerates
-  `IEnumerable<ISubscriber<X>>` as if many subscribers were supported.
+- [Confirmed] Each discovered closed `ISubscriber<X>` is registered as scoped
+  with `TryAddEnumerable`. **Every distinct implementation type per event type
+  is registered and invoked.** (Before the 2026-11-19 fix, `TryAddScoped`
+  registered only the first.) Deduplication:
+  - the same implementation type is registered once across repeated
+    `AddOutbox` calls, an assembly passed twice, or a manual registration by
+    type made before `AddOutbox`;
+  - a manual registration made **after** `AddOutbox` (`AddScoped`), or a
+    factory registration whose return type is the interface
+    (`AddScoped<ISubscriber<X>>(_ => new Sub())`), is not deduplicated against
+    the scanned type, so that subscriber runs twice;
+  - a concrete subscriber and a concrete subclass of it are two
+    implementations, so both run.
+- [Confirmed] An open generic subscriber class (`Sub<T> : ISubscriber<T>`) in
+  a scanned assembly is registered, and `BuildServiceProvider()` then throws
+  `ArgumentException`.
 - [Confirmed] Subscribers are matched on the event's **exact runtime type**.
   `ISubscriber<BaseType>` does not receive derived events.
 - [Confirmed] The handler is invoked by reflection on a public instance method
   `HandleEventAsync(<exact event type>, CancellationToken)`. Explicit interface
   implementations are not found, which results in a `NullReferenceException`
   and counts as a failed attempt.
-- [Confirmed] Multiple subscribers, when registered manually, run sequentially.
-  The first exception stops the rest and fails the whole message.
+- [Confirmed] Multiple subscribers for one event run sequentially, in
+  registration order: manual registrations made before `AddOutbox` first; the
+  order among scanned subscribers follows `Assembly.GetTypes()` and is not
+  guaranteed. The first exception stops the rest and fails the whole message.
+  Unsaved `DbContext` changes left by subscribers that already succeeded are
+  saved together with the failure record, and those subscribers run again on
+  retry.
 - [Confirmed] An event with no registered subscriber is treated as
   successfully handled, and its row is deleted. This relies on Microsoft DI
   returning an empty `IEnumerable<>` for unregistered services. A container
@@ -161,7 +176,8 @@ Each rule is labeled:
 
 ## Evidence
 
-- `src/XDev.Outbox/ServiceCollectionExtensions.cs`: subscriber scanning and `TryAddScoped`.
+- `src/XDev.Outbox/ServiceCollectionExtensions.cs`: subscriber scanning and `TryAddEnumerable`.
+- `tests/XDev.Outbox.Tests/SubscriberRegistrationTests.cs`: subscriber registration and invocation.
 - `src/XDev.Outbox/EventPublisher.cs`
 - `src/XDev.Outbox/OutboxProcessorHostedService.cs`: constants, success and failure handling.
 - `src/XDev.Outbox/ObjectExtensions.cs`, `OutboxConfiguration.cs`

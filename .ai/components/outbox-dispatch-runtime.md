@@ -13,7 +13,9 @@ delivery contract they implement is in `business-rules/message-delivery.md`.
 - It registers `OutboxConfiguration` options only if no
   `IConfigureOptions<OutboxConfiguration>` exists yet. A configuration
   delegate on a later call is ignored.
-- Lifetimes: `IOutbox` scoped, `IEventPublisher` scoped, subscribers scoped,
+- Lifetimes: `IOutbox` scoped, `IEventPublisher` scoped, subscribers scoped
+  (each scanned `ISubscriber<X>` via `TryAddEnumerable`, so every distinct
+  implementation is registered; see `business-rules/message-delivery.md`),
   `IMessageQueue<TKey>` singleton (`MemoryMessageQueue`), hosted service
   singleton (`TryAddEnumerable`), and `TimeProvider.System` (net8+).
 - On net8.0+ the methods extend `IServiceCollection`. On netstandard2.x they

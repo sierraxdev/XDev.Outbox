@@ -52,7 +52,9 @@ library gives to consuming applications.
   the NuGet package readme.
 
 `tests/XDev.Outbox.EFCore.Tests` (xUnit, SQLite in-memory, net8 to net11)
-covers the EF Core save and dispatch path. There is no CI configuration.
+covers the EF Core save and dispatch path. `tests/XDev.Outbox.Tests` (xUnit,
+net8 to net11) covers subscriber registration (`AddOutbox`) and
+`EventPublisher`. There is no CI configuration.
 
 ## Domain Terminology
 
@@ -118,7 +120,11 @@ Run all four target frameworks; EF behavior differs by version.
 - The tests use SQLite in-memory, so SQL Server is not needed.
 - On 2026-11-18 each framework reported 389 tests: 388 passed and 1 skipped.
   The skipped test is the deferred D5 limitation.
-- Coverage is limited to `XDev.Outbox.EFCore`. The core runtime has no tests.
+- Also run `dotnet test tests/XDev.Outbox.Tests -f <tfm>` for the same four
+  frameworks. On 2026-11-19 each reported 11 passed.
+- Core runtime coverage is limited to subscriber registration and
+  `EventPublisher`. The queue and hosted service have no tests, and the
+  netstandard code paths are compiled but not executed by tests.
 
 ### Integration Tests
 

@@ -144,9 +144,10 @@ and is not registered. See `integrations/azure-service-bus.md`.
 These items materially affect future work. Business intent for each is
 unknown unless stated.
 
-- Automated tests cover only the EF Core save and dispatch path
-  (`tests/XDev.Outbox.EFCore.Tests`, SQLite). The core runtime, the
-  SQL Server claim query, and the hosted service have no tests.
+- Automated tests cover the EF Core save and dispatch path
+  (`tests/XDev.Outbox.EFCore.Tests`, SQLite) and subscriber registration
+  (`tests/XDev.Outbox.Tests`). The queue, the SQL Server claim query, and the
+  hosted service have no tests.
 - The save path is a large state machine (about 1,100 lines) that depends on
   undocumented EF change-tracker internals. See
   `decisions/001-deferred-acceptance-and-payload-projection.md`.
