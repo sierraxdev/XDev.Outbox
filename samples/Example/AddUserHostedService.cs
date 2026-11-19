@@ -48,7 +48,7 @@ namespace Example
                                 if (dbContextFactory != null)
                                 {
                                     await using var context = await dbContextFactory.CreateDbContextAsync(stoppingToken);
-                                    await using var contextTransaction = await dbContext.Database.BeginTransactionAsync(stoppingToken);
+                                    await using var contextTransaction = await context.Database.BeginTransactionAsync(stoppingToken);
 
                                     var newUser = new User
                                     {
@@ -78,7 +78,7 @@ namespace Example
                                     var context = scopeStrategy.ServiceProvider.GetRequiredService<ApplicationDbContext>();
                                     var outboxStrategy = scopeStrategy.ServiceProvider.GetRequiredService<IOutbox>();
 
-                                    await using var contextTransaction = await dbContext.Database.BeginTransactionAsync(stoppingToken);
+                                    await using var contextTransaction = await context.Database.BeginTransactionAsync(stoppingToken);
 
                                     var newUser = new User
                                     {
