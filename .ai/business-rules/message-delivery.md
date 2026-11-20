@@ -46,8 +46,14 @@ Each rule is labeled:
   `IMessageQueue<TKey>` and `TimeProvider` through EF's `GetService<T>()`,
   which throws when a service is missing. `AddOutbox` must therefore be
   registered, even for saves with no buffered events.
-- [Confirmed] Library-owned save: after commit, the buffer is cleared and
-  messages are enqueued. After a failure, the buffer is kept.
+- [Confirmed] Library-owned save: after commit, the events it wrote are
+  removed from the buffer (by reference and multiplicity) and its messages
+  are enqueued; events added during the save stay buffered for the next save
+  (since 2026-11-19). After a failure, the buffer is kept.
+- [Confirmed] An event added while a save runs (`SavingChanges`/`SavedChanges`
+  handlers, save interceptors) is never part of that save on any path; it is
+  written by the context's next save, not atomically with the save that
+  raised it. Add events before calling `SaveChanges` for atomicity.
 - [Confirmed] Caller-owned transaction:
   - On commit, committed events are removed from the buffer and dispatched.
     Events never saved in the transaction stay buffered (since 2026-11-19).

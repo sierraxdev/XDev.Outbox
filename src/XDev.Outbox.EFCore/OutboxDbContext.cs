@@ -36,6 +36,12 @@ namespace XDev.Outbox.EFCore
     //
     // State machine for events saved inside a caller-owned transaction (owned saves commit and dispatch in one step).
     //
+    // Every save collects the events to save before calling EF's save, i.e. before EF raises SavingChanges, runs save
+    // interceptors or raises SavedChanges. An event added to the buffer while a save runs is therefore never part of
+    // that save, on any path: an owned save removes from the buffer only the events it wrote (by reference and
+    // multiplicity), a caller-transaction commit removes only the committed ones, and a save without events does not
+    // touch the buffer, so such an event stays buffered and is written by the next save.
+    //
     // A save with events inside a caller transaction runs inside the library's savepoint (__XDevOutboxSavePoint, when
     // the transaction supports savepoints and Database.AutoSavepointsEnabled is true, like EF's own savepoint). When
     // anything after its creation fails (EF's save, payload re-serialization, payload UPDATEs, completion), the save
@@ -129,6 +135,14 @@ namespace XDev.Outbox.EFCore
         /// context are not saved by this one. Events that were never saved are discarded when the context is disposed
         /// or returned to a pool (<c>AddDbContextPool</c>, <c>AddPooledDbContextFactory</c>); a pooled context starts
         /// every lease with an empty buffer.
+        /// <para>
+        /// A save writes the events that were buffered when it was called. Events added while a save runs (for example
+        /// by a <c>SavingChanges</c> or <c>SavedChanges</c> event handler, or by a save interceptor that collects domain
+        /// events) are not part of that save: they stay buffered and are written by this context's next save, not
+        /// atomically with the save during which they were added (after an owned save, the next save runs in a later
+        /// transaction). To write an event atomically with the business changes it describes, add it before
+        /// calling <c>SaveChanges</c>/<c>SaveChangesAsync</c>.
+        /// </para>
         /// </remarks>
         public IOutbox Outbox => _outbox;
 
@@ -250,7 +264,7 @@ namespace XDev.Outbox.EFCore
                 _outboxSaveInProgress = false;
             }
 
-            CompleteOwnedSave(acceptAllChangesOnSuccess);
+            CompleteOwnedSave(saved.Messages, acceptAllChangesOnSuccess);
             foreach (var item in saved.Messages)
             {
                 messageQueue.EnqueueAsync(item.Message).GetAwaiter().GetResult();
@@ -332,7 +346,7 @@ namespace XDev.Outbox.EFCore
                 _outboxSaveInProgress = false;
             }
 
-            CompleteOwnedSave(acceptAllChangesOnSuccess);
+            CompleteOwnedSave(saved.Messages, acceptAllChangesOnSuccess);
             foreach (var item in saved.Messages)
             {
                 await messageQueue.EnqueueAsync(item.Message, cancellationToken);
@@ -886,14 +900,28 @@ namespace XDev.Outbox.EFCore
             return saved.Result;
         }
 
-        private void CompleteOwnedSave(bool acceptAllChangesOnSuccess)
+        /// <summary>
+        /// After an owned save committed: removes from the buffer only the events this save wrote (their original
+        /// instances, by reference and multiplicity). Events added to the buffer while the save ran (a SavingChanges or
+        /// SavedChanges handler, a save interceptor) were not part of it, because the events to save were collected
+        /// before EF raised any save event; they stay buffered and the next save writes them, as on the
+        /// caller-transaction and no-events paths.
+        /// </summary>
+        private void CompleteOwnedSave(IReadOnlyList<SavedOutboxMessage> saved, bool acceptAllChangesOnSuccess)
         {
             if (acceptAllChangesOnSuccess)
             {
                 ChangeTracker.AcceptAllChanges();
             }
-            _outbox.Events.Clear();
-            // Every buffered event, including released ones, was persisted and committed by this save.
+
+            var events = _outbox.Events;
+            foreach (var message in saved)
+            {
+                var index = events.FindIndex(x => ReferenceEquals(x, message.Event));
+                if (index >= 0) events.RemoveAt(index);
+            }
+            // Every event the save collected, including released ones, was persisted and committed by this save; an
+            // event added during the save was never saved or released.
             _releasedNotAcceptedEvents.Clear();
         }
 

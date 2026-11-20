@@ -571,21 +571,24 @@ public class TesterNeverSavedOnCommitTests
     // ---------------- Events added during a save ----------------
 
     /// <summary>
-    /// KNOWN GAP (characterization, found by the developer; not changed by this fix). An event added by a SavingChanges
-    /// handler during an owned save (no caller transaction) is dropped without a row: CompleteOwnedSave clears the
-    /// whole buffer. Its business change (none here) would be committed without an event.
+    /// An event added by a SavingChanges handler during an owned save (no caller transaction) is not part of that save
+    /// (the events to save were collected before EF raised SavingChanges). Since fix-owned-save-drops-events-added-during-save
+    /// the owned save removes only the events it wrote, so this one stays buffered and is written once by the next
+    /// save, as in a caller transaction (next test). Before that fix the owned save cleared the whole buffer and the
+    /// event was dropped without a row.
     /// </summary>
     [Theory]
     [MemberData(nameof(Async))]
-    public async Task KnownGap_EventAddedBySavingChangesDuringOwnedSave_DroppedWithoutRow(bool async)
+    public async Task EventAddedBySavingChangesDuringOwnedSave_Kept_WrittenOnceByNextSave(bool async)
     {
         using var host = CommitTesterHost.Create();
         var (scope, db) = host.CreateScope();
         using var _s = scope;
         var added = 0;
+        PlainEvent? during = null;
         db.SavingChanges += (_, _) =>
         {
-            if (added++ == 0) db.Outbox.AddEvent(new PlainEvent { Text = "during save" });
+            if (added++ == 0) db.Outbox.AddEvent(during = new PlainEvent { Text = "during save" });
         };
 
         AddUserWithEvent(db, "a", out _);
@@ -593,11 +596,14 @@ public class TesterNeverSavedOnCommitTests
 
         AssertCommittedWithOneRowEach(host, "a");
         Assert.DoesNotContain(host.OutboxRows(), r => r.Payload.Contains("during save"));
-        // Dropped: never written by this or any later save.
-        Assert.Empty(db.Outbox.GetEvents());
+        Assert.Same(during, Assert.Single(db.Outbox.GetEvents()));
+
         db.Docs.Add(new Doc { Id = Guid.NewGuid(), Title = "later" });
         await Save.Invoke(db, async);
-        Assert.Single(host.OutboxRows());
+        Assert.Equal(2, host.OutboxRows().Count);
+        Assert.Single(host.OutboxRows(), r => r.Payload.Contains("during save"));
+        Assert.Equal(2, host.Queue.Enqueued.Count);
+        Assert.Empty(db.Outbox.GetEvents());
     }
 
     /// <summary>
@@ -768,7 +774,7 @@ public sealed class CommitTesterHost : IDisposable
     public AfterCommitSabotage AfterCommit { get; }
     public CommitCounter Commits { get; }
 
-    public static CommitTesterHost Create(bool retrying = false, bool ensureCreated = true)
+    public static CommitTesterHost Create(bool retrying = false, bool ensureCreated = true, IInterceptor[]? extraInterceptors = null)
     {
         var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
@@ -786,6 +792,7 @@ public sealed class CommitTesterHost : IDisposable
                 if (retrying) sqlite.ExecutionStrategy(d => new TestRetryingExecutionStrategy(d));
             });
             options.AddInterceptors(new FaultCommandInterceptor(faults), new FaultCommitInterceptor(faults), afterCommit, commits);
+            if (extraInterceptors != null) options.AddInterceptors(extraInterceptors);
             options.ConfigureWarnings(w => w.Ignore(CoreEventId.ManyServiceProvidersCreatedWarning));
         });
         services.AddOutbox<int>(typeof(CommitTesterHost).Assembly);

@@ -65,7 +65,8 @@ logic lives in `SaveChanges(bool)` and `SaveChangesAsync(bool, ct)`:
   2. Payloads are patched with generated keys.
   3. It commits.
   4. It accepts changes, if the flag is true.
-  5. It clears the buffer and enqueues the messages.
+  5. It removes the events it wrote from the buffer (events added during
+     the save stay) and enqueues the messages.
 - **Ambient transaction:** it runs the same save and patch, then records the
   messages as pending. The interceptor dispatches them when the caller
   commits. If the transaction ends without a commit, the events follow their

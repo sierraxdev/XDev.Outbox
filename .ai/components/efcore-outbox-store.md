@@ -106,7 +106,9 @@ This path applies when there is no `Database.CurrentTransaction`.
   `ReadCommitted` transaction, and commits.
 - After success:
   1. Call `AcceptAllChanges()`, only when the flag is true.
-  2. Clear the buffer.
+  2. Remove from the buffer only the events this save wrote (by reference
+     and multiplicity). Events added during the save stay buffered for the
+     next save (since 2026-11-19).
   3. Enqueue the messages. The sync path blocks on `EnqueueAsync`.
 - Dispatch happens in the save method, after acceptance. The interceptor
   ignores owned transactions; this is guarded by save depth and
@@ -271,13 +273,32 @@ constructor throws naming the registration methods.
     copy per attempt, so the next save writes duplicates;
   - EF-internal commits on the context (e.g. `EnsureCreated`) reach the
     interceptor and keep buffered events.
-- **Owned save drops events added during the save (open, needs a
-  decision).** `CompleteOwnedSave` clears the whole buffer, so an event added
-  after the event list was captured (a `SavingChanges` handler or a
-  `SaveChangesInterceptor` collecting domain events) is dropped without a
-  row. In a caller transaction the same event is kept and written by a later
-  save. Pinned by
-  `KnownGap_EventAddedBySavingChangesDuringOwnedSave_DroppedWithoutRow`.
+- **Events added during a save are written by the next save.** Every save
+  captures its events before EF's save runs, so an event added by a
+  `SavingChanges`/`SavedChanges` handler or a save interceptor (e.g. one
+  collecting domain events) is never part of that save, on any path (owned,
+  caller, no-events). It stays buffered and is written by the context's next
+  save, not atomically with the save that raised it, or lost if the context
+  ends first. To publish atomically, add events before calling `SaveChanges`.
+  Under a retrying strategy, an unguarded handler adds one copy per attempt
+  (one row each). Owned saves used to drop such events (fixed 2026-11-19).
+  Tests: `OwnedSaveEventsAddedDuringSaveTests` (SQLite and SQL Server),
+  `TesterNeverSavedOnCommitTests.EventAddedBySavingChangesDuringOwnedSave_Kept_WrittenOnceByNextSave`.
+- **Nested save from a save handler is unsupported (open, pre-existing).** A
+  `SavingChanges` handler that calls `SaveChanges` during an owned save sees
+  the library's own transaction as current and takes the caller path,
+  re-saving the buffer: nested `SaveChanges(true)` writes the outer event
+  twice; nested `SaveChanges(false)` makes the outer save fail with
+  `DbUpdateException`. Pinned by
+  `PreExistingHazard_NestedSaveFromSavingChangesHandler_OuterEventDuplicatedOrSaveFails`.
+- **`AcceptAllChanges` throwing after an owned commit (open, pre-existing,
+  low).** `CompleteOwnedSave` accepts changes before updating the buffer; if
+  acceptance throws (e.g. a `ChangeTracker.StateChanged` handler), the
+  committed event is not dispatched in memory, stays buffered and is written
+  again by the next save. Pinned by
+  `PreExistingDefect_AcceptAllChangesThrowsAfterOwnedCommit_CommittedEventWrittenTwice`.
+- Buffered events are matched to saved messages by reference, not by value:
+  a value-equal record instance is a separate event.
 - **Commit outcome unknown.** If the server commits but EF reports a failed
   commit (e.g. an app interceptor throws in `TransactionCommitted`), the
   library applies B1: a flag=false event is kept and written again by the
