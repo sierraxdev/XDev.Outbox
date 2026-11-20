@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete, uncommitted (2026-11-19). Workflow: Bug Fix. Both found by the D5 adversarial
+Complete (2026-11-19, committed in 5980efe). Workflow: Bug Fix. Both found by the D5 adversarial
 tests (`tasks/fix-d5-caller-transaction-partial-save.md`).
 
 ## Bug 1 — explicit `Rollback()` after a failed save loses the event

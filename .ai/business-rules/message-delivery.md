@@ -49,9 +49,8 @@ Each rule is labeled:
 - [Confirmed] Library-owned save: after commit, the buffer is cleared and
   messages are enqueued. After a failure, the buffer is kept.
 - [Confirmed] Caller-owned transaction:
-  - On commit, committed and never-saved events are removed from the buffer.
-    [Observed, intent unknown] Dropping never-saved events on commit can lose
-    events whose business changes are still pending (open item).
+  - On commit, committed events are removed from the buffer and dispatched.
+    Events never saved in the transaction stay buffered (since 2026-11-19).
   - If the transaction ends without commit (rollback, failed commit, failed
     rollback, or dispose; all behave the same since 2026-11-19), the events
     follow their business changes:
@@ -59,7 +58,7 @@ Each rule is labeled:
     - saved with `true`: the events are dropped;
     - never saved in it (failed save, added before or after the saves): the
       events stay buffered.
-  - An app that abandons its unit of work after a rollback must call
+  - An app that abandons its unit of work after any transaction end must call
     `dbContext.Outbox.ClearEvents()`; otherwise the kept events are persisted
     by the next save without their business changes.
   - Rows undone by `RollbackToSavepoint` are not dispatched.

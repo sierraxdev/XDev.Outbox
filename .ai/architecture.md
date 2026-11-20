@@ -31,7 +31,7 @@ broker is used by the shipped components.
 | `OutboxProcessorHostedService<TKey>` | XDev.Outbox | Polls the store, consumes the queue, deletes or records failure. |
 | `IOutboxStore<TKey>` | XDev.Outbox | Store abstraction (claim, remove, update). |
 | `OutboxDbContext<TKey>` | XDev.Outbox.EFCore | Base DbContext that persists buffered events atomically with business data. |
-| `OutboxDispatchTransactionInterceptor<TKey>` | XDev.Outbox.EFCore | Enqueues messages after commit and clears the buffer after commit or rollback. |
+| `OutboxDispatchTransactionInterceptor<TKey>` | XDev.Outbox.EFCore | Enqueues messages after commit and tells the context how each caller transaction ended, so it can update its buffer. |
 | `EntityFrameworkOutboxStore<TKey,TContext>` (scoped) | XDev.Outbox.EFCore | SQL Server implementation of `IOutboxStore`. |
 | `OutboxMessageConfiguration<TKey>` | XDev.Outbox.EFCore | Table mapping and JSON payload conversion. |
 

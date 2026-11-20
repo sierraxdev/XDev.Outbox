@@ -30,10 +30,11 @@ namespace XDev.Outbox.EFCore
 
         /// <summary>
         /// The given transaction committed. Returns and forgets the messages saved in it that can be dispatched, and
-        /// updates the event buffer: events committed in it and events never saved are removed; events
-        /// of messages saved in another (ended, uncommitted) transaction follow the rule of
-        /// <see cref="EndTransactionWithoutCommit"/>; events kept by an earlier release whose business changes are still
-        /// pending stay buffered.
+        /// updates the event buffer: events committed in it are removed; events of messages saved in another (ended,
+        /// uncommitted) transaction follow the rule of <see cref="EndTransactionWithoutCommit"/>; events kept by an
+        /// earlier release whose business changes are still pending stay buffered, and so do events never saved in it
+        /// (no pending message: added after the last save or before the transaction, kept by an earlier end, or their
+        /// save failed), with their still-pending business changes.
         /// </summary>
         IReadOnlyList<OutboxMessage<TKey>> TransactionCommitted(Guid transactionId);
 

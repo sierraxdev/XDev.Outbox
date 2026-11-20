@@ -54,17 +54,20 @@ namespace XDev.Outbox.EFCore
     // Transitions and buffer rule:
     //   - savepoint rollback / successful check: rows that no longer exist are released (below); existing rows confirmed.
     //   - committing: unconfirmed messages are checked again; if that fails, a warning (UnconfirmedAtCommitEventId) is logged.
-    //   - committed: confirmed messages are dispatched; their events and never-saved events leave the buffer.
+    //   - committed: confirmed messages are dispatched; their events leave the buffer.
     //   - ended without commit (rollback, failed commit/rollback) and stale (another transaction is current or
-    //     committed, i.e. the earlier one was disposed): every pending message is released. Never-saved events
-    //     (buffered events with no pending message: added after the last save or before the transaction, or whose
-    //     save failed) stay buffered for every end without commit; only a commit drops them.
+    //     committed, i.e. the earlier one was disposed): every pending message is released.
     //   - released: no dispatch. Accepted -> its event leaves the buffer (the changes will not be saved again).
     //     Not accepted -> its event stays buffered and is recorded in _releasedNotAcceptedEvents.
-    // _releasedNotAcceptedEvents (by reference and multiplicity) keeps those events distinguishable from never-saved
-    // events, so a later commit of another transaction without a save does not drop them (never-saved events are
-    // dropped on commit). An entry leaves the list when its event is saved again (pending again, or persisted by an
-    // owned save), when a flag = true save accepts the business changes, or when the event is no longer in the buffer.
+    // Never-saved events (buffered events with no pending message of the ended transaction: added after the last save
+    // or before the transaction, kept by an earlier end, or whose save failed) stay buffered for every end, commit
+    // included, with their still-pending business changes. An event therefore leaves the buffer only when it is
+    // committed (caller or owned save), when its saved, accepted message is released (above), by Outbox.ClearEvents(),
+    // or at the end of the context/pool lease.
+    // _releasedNotAcceptedEvents (by reference and multiplicity) records the released, not accepted events. Since
+    // never-saved events are kept on commit too, it no longer changes which events stay buffered. An entry leaves the
+    // list when its event is saved again (pending again, or persisted by an owned save), when a flag = true save
+    // accepts the business changes, or when the event is no longer in the buffer.
     public abstract class OutboxDbContext<TKey, TContext> : DbContext, IOutboxTransactionParticipant<TKey> where TKey : struct where TContext : DbContext, IOutboxDbContext<TKey>
     {
         // Upper bound of ids per existence query after a rollback to a savepoint (keeps parameter counts low).
@@ -413,7 +416,8 @@ namespace XDev.Outbox.EFCore
             // transaction that ended without a commit (disposed); they follow the rule for an uncommitted end.
             var stale = isCurrent ? new List<SavedOutboxMessage>() : _pendingOutboxMessages.ToList();
 
-            UpdateBuffer(released: stale, committed: committed, keepUnsavedEvents: false);
+            // Events never saved in the committed transaction stay buffered with their still-pending business changes.
+            UpdateBuffer(released: stale, committed: committed, keepUnsavedEvents: true);
             _pendingOutboxMessages.Clear();
             _pendingTransactionId = null;
 
@@ -499,7 +503,8 @@ namespace XDev.Outbox.EFCore
             {
                 message.AcceptedChanges = true;
             }
-            // Changes of released, not accepted messages are accepted too: their events must not be saved later.
+            // Changes of released, not accepted messages are accepted too, so they are no longer tracked as released. (Since
+            // every transaction end keeps unsaved events, this list no longer changes which events stay buffered.)
             _releasedNotAcceptedEvents.Clear();
         }
 
@@ -730,7 +735,8 @@ namespace XDev.Outbox.EFCore
         /// (their transaction decides). Events kept earlier for released, not accepted messages
         /// (<c>_releasedNotAcceptedEvents</c>) are kept. Other events (never saved: no pending message, e.g. added
         /// after the last save or before the transaction, or their save failed) are kept only when
-        /// <paramref name="keepUnsavedEvents"/> is true (every end without commit); a commit removes them.
+        /// <paramref name="keepUnsavedEvents"/> is true, which every caller passes (every end of a transaction,
+        /// commit included, keeps them).
         /// <c>_releasedNotAcceptedEvents</c> is rebuilt from the buffer, so entries whose event the application
         /// removed from the buffer are forgotten.
         /// </summary>

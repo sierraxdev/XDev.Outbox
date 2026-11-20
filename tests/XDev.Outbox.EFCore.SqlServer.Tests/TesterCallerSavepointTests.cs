@@ -467,6 +467,61 @@ public class TesterCallerSavepointTests : IClassFixture<SmokeDatabaseFixture>
         Assert.Empty(db.Outbox.GetEvents());
     }
 
+    // ---------------- Never-saved events on commit (fix-commit-drops-never-saved-events) ----------------
+
+    /// <summary>
+    /// A save fails after its writes (undone by the library's savepoint) and the caller commits anyway: the commit
+    /// writes and dispatches nothing and keeps the never-saved event; a later save commits the user with its outbox
+    /// row, dispatched once. With <paramref name="laterCommit"/> the event is first kept by one more transaction that
+    /// commits without saving it. (Before the fix the commit dropped the event and the later save committed the user
+    /// without an outbox row.)
+    /// </summary>
+    [SqlServerTheory]
+    [InlineData(false, false, false)]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, false)]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, false)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    [InlineData(true, true, true)]
+    public async Task FailedSaveThenCommit_EventKept_LaterSaveCommitsUserWithItsRowOnce(bool async, bool flag, bool laterCommit)
+    {
+        using var host = CreateHost();
+        await using var scope = host.CreateScope();
+        var db = scope.Db;
+
+        await using (var tx = await Begin(db, async))
+        {
+            var failed = AddUserWithEvent(db, "failed@test", "f1");
+            host.Faults.FailCommands(SqlMatch.IsOutboxPayloadUpdate, FaultTiming.AfterExecution);
+            var call = async
+                ? (flag ? SaveCall.SaveChangesAsyncTrue : SaveCall.SaveChangesAsyncFalse)
+                : (flag ? SaveCall.SaveChangesTrue : SaveCall.SaveChangesFalse);
+            Assert.IsType<InjectedTransientException>(await Record.ExceptionAsync(() => Save.Invoke(db, call)));
+            Assert.Equal(EntityState.Added, db.Entry(failed).State);
+            await Commit(tx, async);
+        }
+
+        Assert.Single(db.Outbox.GetEvents());
+        Assert.Empty(host.Database.Users());
+        Assert.Empty(host.OutboxRows());
+        Assert.Empty(host.Queue.Enqueued);
+
+        if (laterCommit)
+        {
+            await using var tx = await Begin(db, async);
+            await Commit(tx, async);
+            Assert.Single(db.Outbox.GetEvents());
+            Assert.Empty(host.Queue.Enqueued);
+        }
+
+        await Save.Invoke(db, async);
+
+        AssertCommittedAndDispatchedOnce(host, "failed@test");
+        Assert.Empty(db.Outbox.GetEvents());
+    }
+
     // ---------------- 8. Identity map after a partial EF save on SQL Server ----------------
 
     /// <summary>

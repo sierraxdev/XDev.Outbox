@@ -226,8 +226,12 @@ public class ReleasedEventTrackingTests
     /// <summary>
     /// No phantom: the application clears the buffer of a released event, an accepting save without events accepts
     /// the pending changes, then the same instance is re-added: it is a fresh (never-saved) event. A rollback keeps it
-    /// like any other never-saved event (since fix-rollback-event-loss-and-retry-identity-conflict; before, it was
-    /// dropped); a commit drops it like any other never-saved event (a phantom released entry would keep it).
+    /// like any other never-saved event (since fix-rollback-event-loss-and-retry-identity-conflict), and so does a
+    /// commit (since fix-commit-drops-never-saved-events; before, the commit dropped it and that drop was how this test
+    /// detected a phantom released entry, which would have kept it). Released and never-saved events now get the same
+    /// buffer outcome at every end of a transaction, so a phantom entry is no longer observable through the buffer;
+    /// the test checks the outcome that matters: a later save persists the re-added event exactly once (no duplicate
+    /// row from a stale entry) and dispatches it once.
     /// </summary>
     [Theory]
     [InlineData(false, false)]
@@ -257,10 +261,18 @@ public class ReleasedEventTrackingTests
             }
         }
 
-        if (commit) Assert.Empty(scope.Outbox.GetEvents());
-        else Assert.Same(evt, Assert.Single(scope.Outbox.GetEvents()));
+        Assert.Same(evt, Assert.Single(scope.Outbox.GetEvents()));
         Assert.Equal(0, host.Count("OutboxMessages"));
         Assert.Empty(host.Queue.Enqueued);
+
+        scope.Db.VersionedItems.Add(new Versioned { Name = "unrelated" });
+        await Save.Invoke(scope.Db, async);
+
+        var row = Assert.Single(host.OutboxRows());
+        Assert.Equal(row.Id, Assert.Single(host.Queue.Enqueued).Id);
+        Assert.Empty(scope.Outbox.GetEvents());
+        // The user was committed by the commit variant only (the rollback variant undid it; its changes were accepted).
+        Assert.Equal(commit ? 1 : 0, host.Count("Users"));
     }
 
     /// <summary>

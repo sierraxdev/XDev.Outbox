@@ -330,8 +330,9 @@ public class CallerTransactionPartialSaveTests
         Assert.Equal(0, host.Scalar("SELECT COUNT(*) FROM \"Users\""));
         Assert.Empty(host.OutboxRows());
         Assert.Empty(host.Queue.Enqueued);
-        // Committing drops never-saved events; a released, not accepted event stays buffered (B1).
-        Assert.Equal(retryBeforeRollback && !flag ? 1 : 0, outbox.GetEvents().Count);
+        // Committing keeps never-saved events (fix-commit-drops-never-saved-events); a released event follows B1:
+        // kept when not accepted, dropped when accepted.
+        Assert.Equal(retryBeforeRollback && flag ? 0 : 1, outbox.GetEvents().Count);
     }
 
     // ---------------- Interceptor events ----------------

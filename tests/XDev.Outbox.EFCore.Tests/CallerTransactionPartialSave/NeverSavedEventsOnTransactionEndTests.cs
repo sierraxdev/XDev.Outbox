@@ -11,7 +11,8 @@ namespace XDev.Outbox.EFCore.Tests.CallerTransactionPartialSave;
 /// outcome is the same. Events with no pending message in the ended transaction (never saved: the save failed, they
 /// were added after the last save, or before the transaction) stay buffered and follow their still-pending business
 /// changes. B1 is unchanged for saved events: saved with acceptAllChangesOnSuccess = false -> kept; true -> dropped.
-/// The commit path is unchanged and pinned at the end of this class: never-saved events are dropped on commit.
+/// Commit (fix-commit-drops-never-saved-events): never-saved events are kept on commit too (end of this class;
+/// more in <see cref="NeverSavedEventsOnCommitTests"/>).
 /// </summary>
 public class NeverSavedEventsOnTransactionEndTests
 {
@@ -183,7 +184,7 @@ public class NeverSavedEventsOnTransactionEndTests
         AssertCommittedWithOneRowEach(host, db, "pending", "failed", "later");
     }
 
-    // ---------------- Commit path: unchanged, pinned ----------------
+    // ---------------- Commit path (fix-commit-drops-never-saved-events) ----------------
 
     public enum NeverSavedOnCommit
     {
@@ -207,43 +208,44 @@ public class NeverSavedEventsOnTransactionEndTests
     }
 
     /// <summary>
-    /// PINNED CURRENT BEHAVIOR (not changed by this fix; reported as a hazard): a commit removes never-saved events
-    /// from the buffer although their business changes are still pending in the tracker, so a later save commits the
-    /// user WITHOUT an outbox row.
+    /// A commit keeps never-saved events with their still-pending business changes, so a later save commits the user
+    /// WITH its outbox row, dispatched once. (Before fix-commit-drops-never-saved-events the commit dropped the event
+    /// and the later save committed the user without an outbox row.)
     /// </summary>
     [Theory]
     [MemberData(nameof(CommitAsync))]
-    public async Task NeverSavedEventThenCommit_EventDropped_LaterSaveCommitsUserWithoutOutboxRow(NeverSavedOnCommit scenario, bool async)
+    public async Task NeverSavedEventThenCommit_EventKept_LaterSaveCommitsUserWithOutboxRowDispatchedOnce(NeverSavedOnCommit scenario, bool async)
     {
         using var host = TesterSavepointHost.Create();
         var (scope, db, _) = host.CreateScope();
         using var _s = scope;
 
-        if (scenario == NeverSavedOnCommit.AddedBeforeTransaction) AddUserWithEvent(db, "never", out _);
+        UserCreated never = null!;
+        if (scenario == NeverSavedOnCommit.AddedBeforeTransaction) AddUserWithEvent(db, "never", out never);
         using (var tx = await Begin(db, async))
         {
             if (scenario == NeverSavedOnCommit.AddedAfterLastSave)
             {
                 AddUserWithEvent(db, "saved", out _);
                 await Save.Invoke(db, async);
-                AddUserWithEvent(db, "never", out _);
+                AddUserWithEvent(db, "never", out never);
             }
             if (scenario == NeverSavedOnCommit.FailedSave)
             {
-                AddUserWithEvent(db, "never", out _);
+                AddUserWithEvent(db, "never", out never);
                 host.Probe.FailAfterExecution(SqlMatch.IsOutboxUpdate);
                 Assert.IsType<InjectedFailureException>(await Record.ExceptionAsync(() => Save.Invoke(db, async)));
             }
             await Commit(tx, async);
         }
 
-        Assert.Empty(db.Outbox.GetEvents());
-        var dispatchedBefore = host.Queue.Enqueued.Count;
+        Assert.Equal(new object[] { never }, db.Outbox.GetEvents());
+        Assert.DoesNotContain(host.Users(), u => u.Email == "never");
+        Assert.Equal(scenario == NeverSavedOnCommit.AddedAfterLastSave ? 1 : 0, host.Queue.Enqueued.Count);
 
         await Save.Invoke(db, async);
 
-        Assert.Contains(host.Users(), u => u.Email == "never");
-        Assert.Equal(scenario == NeverSavedOnCommit.AddedAfterLastSave ? 1 : 0, host.OutboxRows().Count);
-        Assert.Equal(dispatchedBefore, host.Queue.Enqueued.Count);
+        if (scenario == NeverSavedOnCommit.AddedAfterLastSave) AssertCommittedWithOneRowEach(host, db, "saved", "never");
+        else AssertCommittedWithOneRowEach(host, db, "never");
     }
 }

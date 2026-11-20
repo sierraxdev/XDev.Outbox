@@ -13,11 +13,12 @@ namespace XDev.Outbox.EFCore
     /// messages saved in it go to the in-memory dispatcher; on rollback, or when the commit or rollback itself fails
     /// (the outcome is unknown, and a committed row is still found by the outbox poller), they are dropped. Their
     /// buffered events stay buffered when they were saved with acceptAllChangesOnSuccess = false (the business changes
-    /// are still pending and will be saved again) and are removed otherwise; buffered events that were never saved in
-    /// it stay buffered (a commit removes them).
-    /// An event kept for pending business changes (saved with acceptAllChangesOnSuccess = false) stays buffered until
-    /// it is saved again or its changes are accepted, also across later transactions that end without saving it. An
-    /// event that was never saved is removed by any later commit that does not save it. A rollback to a savepoint drops the messages whose rows it undid, with the same
+    /// are still pending and will be saved again) and are removed otherwise. Buffered events that were never saved in
+    /// the transaction stay buffered whether it commits or not, with their still-pending business changes.
+    /// An event kept for pending business changes (saved with acceptAllChangesOnSuccess = false, or never saved) stays
+    /// buffered until it is saved and committed (or saved with acceptAllChangesOnSuccess = true in a transaction that
+    /// does not commit, as above), also across later transactions that end, with or without a commit, without saving
+    /// it; <c>Outbox.ClearEvents()</c> or the end of the context (or pool lease) discards it. A rollback to a savepoint drops the messages whose rows it undid, with the same
     /// buffer rule; rollbacks to savepoints made inside a save (EF's own, and the context's savepoint undoing a
     /// failed save with events) are ignored, since they cannot undo rows of earlier saves. When the rows a rollback
     /// to a savepoint undid cannot be determined even just before the commit, the commit proceeds, the affected messages are left to the outbox poller and a warning is logged under

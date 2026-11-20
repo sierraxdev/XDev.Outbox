@@ -176,7 +176,8 @@ The authoritative summary is the comment at the top of
 - **Commit:**
   1. Unconfirmed messages are re-checked in `TransactionCommitting`.
   2. Confirmed messages are dispatched.
-  3. Committed and never-saved events are removed from the buffer.
+  3. Committed events are removed from the buffer. Events never saved in
+     the transaction stay buffered (since 2026-11-19).
 - **End without commit (B1).** This covers rollback, a failed commit or
   rollback, and stale detection after a dispose.
   - flag=false: the events stay buffered, and the business changes stay
@@ -246,25 +247,41 @@ constructor throws naming the registration methods.
   rollback fails (doomed transaction, e.g. `XACT_ABORT`, SQL error 3903), or
   no savepoint existed and EF's save had completed, warning EventId 41002
   `XDev.Outbox.EFCore.CallerTransactionSaveNotUndone` is logged.
-- **Never-saved events on transaction end (2026-11-19).** Events in the
-  buffer with no pending message in the ended transaction (failed saves,
-  events added before the transaction or after its last save) stay buffered
-  when the transaction ends without commit: explicit `Rollback()`, failed
-  commit, failed rollback or dispose all behave the same. (Before, an
-  explicit rollback dropped them, so a retry committed the entity without
-  its outbox row.) Consequence: if the app abandons the unit of work after a
-  rollback (`ChangeTracker.Clear()`, re-running logic), it must also call
-  `Outbox.ClearEvents()`, or the kept event is persisted by the next save
-  without its business change (payload keys 0). Pinned by
-  `TesterRollbackKeepTests`.
-- **Commit drops never-saved events (open, needs a decision).** A commit
-  removes buffered events that were not saved in it: event added before
-  `BeginTransaction` and commit without a save; event added after the last
-  save; failed save then commit; never-saved events kept by an earlier
-  rollback/dispose and a later transaction that commits without saving them.
-  The business changes stay pending, so a later save commits them without an
-  outbox row (silent event loss). Pinned by
-  `NeverSavedEventsOnTransactionEndTests.NeverSavedEventThenCommit_...`.
+- **Never-saved events stay buffered at every transaction end
+  (2026-11-19).** Events in the buffer with no pending message in the ended
+  transaction (failed saves, events added before the transaction or after its
+  last save, events kept by an earlier end) stay buffered on commit, explicit
+  `Rollback()`, failed commit, failed rollback and dispose alike. An event
+  leaves the buffer only when it is saved and committed, when its saved and
+  accepted message is released (B1), through `Outbox.ClearEvents()`, or when
+  the context or pool lease ends. (Before, a commit dropped them, and an
+  explicit rollback did too, so a later save committed the business change
+  without its outbox row.) `_releasedNotAcceptedEvents` and the
+  `keepUnsavedEvents` parameter no longer affect outcomes (cleanup
+  candidate). Pinned by `NeverSavedEventsOnCommitTests`,
+  `NeverSavedEventsOnTransactionEndTests`, `TesterRollbackKeepTests`,
+  `TesterNeverSavedOnCommitTests`. Consumer consequences:
+  - an app that abandons its unit of work (`ChangeTracker.Clear()`,
+    re-running logic) must call `Outbox.ClearEvents()`, or the kept event is
+    persisted by the next save without its business change (payload keys 0);
+  - events for changes made without `SaveChanges` (ExecuteUpdate/Delete, raw
+    SQL, another context) are written by the context's next, unrelated save,
+    in a later transaction, or lost when the context ends;
+  - a retried unit of work that adds an event without saving it keeps one
+    copy per attempt, so the next save writes duplicates;
+  - EF-internal commits on the context (e.g. `EnsureCreated`) reach the
+    interceptor and keep buffered events.
+- **Owned save drops events added during the save (open, needs a
+  decision).** `CompleteOwnedSave` clears the whole buffer, so an event added
+  after the event list was captured (a `SavingChanges` handler or a
+  `SaveChangesInterceptor` collecting domain events) is dropped without a
+  row. In a caller transaction the same event is kept and written by a later
+  save. Pinned by
+  `KnownGap_EventAddedBySavingChangesDuringOwnedSave_DroppedWithoutRow`.
+- **Commit outcome unknown.** If the server commits but EF reports a failed
+  commit (e.g. an app interceptor throws in `TransactionCommitted`), the
+  library applies B1: a flag=false event is kept and written again by the
+  next save (duplicate, as plain EF re-running the change).
 - **Recovery re-keys outbox entries before detaching (2026-11-19).** When
   EF's own save fails after an earlier command produced a generated outbox
   key, EF reverts the entry to a temporary key but its identity map keeps
