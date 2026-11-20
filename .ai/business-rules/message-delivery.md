@@ -49,7 +49,10 @@ Each rule is labeled:
 - [Confirmed] Library-owned save: after commit, the events it wrote are
   removed from the buffer (by reference and multiplicity) and its messages
   are enqueued; events added during the save stay buffered for the next save
-  (since 2026-11-19). After a failure, the buffer is kept.
+  (since 2026-11-19). After a failure, the buffer is kept. If
+  `AcceptAllChanges` throws after the commit, the written events still leave
+  the buffer, the exception propagates and nothing is dispatched in memory;
+  the poller delivers the committed rows after their lock expires.
 - [Confirmed] An event added while a save runs (`SavingChanges`/`SavedChanges`
   handlers, save interceptors) is never part of that save on any path; it is
   written by the context's next save, not atomically with the save that

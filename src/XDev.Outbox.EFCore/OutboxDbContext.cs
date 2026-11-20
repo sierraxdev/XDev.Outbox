@@ -34,7 +34,9 @@ namespace XDev.Outbox.EFCore
     // are therefore discarded when the context is returned to a pool (or disposed); pending messages of a caller
     // transaction left open at the end of a lease are never dispatched (EF rolls that transaction back).
     //
-    // State machine for events saved inside a caller-owned transaction (owned saves commit and dispatch in one step).
+    // State machine for events saved inside a caller-owned transaction (owned saves commit and dispatch in one step:
+    // after the commit they remove their events from the buffer, then accept changes (flag = true), then enqueue; if
+    // acceptance throws, the exception propagates, nothing is enqueued and the poller delivers the committed rows).
     //
     // Every save collects the events to save before calling EF's save, i.e. before EF raises SavingChanges, runs save
     // interceptors or raises SavedChanges. An event added to the buffer while a save runs is therefore never part of
@@ -906,14 +908,15 @@ namespace XDev.Outbox.EFCore
         /// SavedChanges handler, a save interceptor) were not part of it, because the events to save were collected
         /// before EF raised any save event; they stay buffered and the next save writes them, as on the
         /// caller-transaction and no-events paths.
+        /// <para>
+        /// The buffer is updated before <c>AcceptAllChanges</c> (flag = true) runs, because the save has already
+        /// committed: if acceptance throws (e.g. a <c>ChangeTracker.StateChanged</c> handler), the exception propagates
+        /// unchanged, as with plain EF, and the committed events are not written again by a later save. The caller then
+        /// skips the in-memory enqueue; the outbox poller delivers the committed rows after their LockExpiresAt.
+        /// </para>
         /// </summary>
         private void CompleteOwnedSave(IReadOnlyList<SavedOutboxMessage> saved, bool acceptAllChangesOnSuccess)
         {
-            if (acceptAllChangesOnSuccess)
-            {
-                ChangeTracker.AcceptAllChanges();
-            }
-
             var events = _outbox.Events;
             foreach (var message in saved)
             {
@@ -923,6 +926,11 @@ namespace XDev.Outbox.EFCore
             // Every event the save collected, including released ones, was persisted and committed by this save; an
             // event added during the save was never saved or released.
             _releasedNotAcceptedEvents.Clear();
+
+            if (acceptAllChangesOnSuccess)
+            {
+                ChangeTracker.AcceptAllChanges();
+            }
         }
 
         private SaveAttempt BeginAttempt(IReadOnlyList<object> events, TimeProvider timeProvider)

@@ -64,7 +64,7 @@ No indexes beyond the PK are defined.
       SELECT TOP (@take) * FROM [<schema>].[<table>] WITH (ROWLOCK, READPAST, UPDLOCK)
       WHERE (Attemps IS NULL OR Attemps < @maxAttemps)
         AND (LockExpiresAt IS NULL OR LockExpiresAt < @dateTimeNow)
-      ORDER BY Id)
+      ORDER BY Id)  -- TOP and ORDER BY only when itemsCount has a value
   UPDATE cte SET LockExpiresAt = @lockExpiration OUTPUT INSERTED.*;
   ```
 
@@ -114,10 +114,13 @@ No indexes beyond the PK are defined.
 - **Known limitation.** The claim SQL hard-codes undelimited column names
   (`Id`, `Attemps`, `LockExpiresAt`); renaming them (`HasColumnName`, naming
   conventions) breaks the claim while saves keep working.
-- **Defect (open, pre-existing).** `GetAllAsync(itemsCount: null)` fails on
-  SQL Server with error 1033: the CTE keeps `ORDER BY Id` but emits
-  `TOP (@take)` only when `itemsCount` has a value. The hosted poller always
-  passes a count, so it is unaffected; direct callers using the default are.
+- `GetAllAsync(itemsCount: null)` claims every eligible row in one
+  statement, with no `TOP` and no `ORDER BY` (SQL Server rejects `ORDER BY`
+  in a CTE without `TOP`, error 1033); the result order is unspecified. On a
+  large backlog this locks many rows at once and SQL Server may escalate
+  to a table lock (above about 5,000 row locks, despite `ROWLOCK`), blocking
+  concurrent outbox inserts while the statement runs. The hosted poller always passes
+  a count. (Failed with error 1033 before 2026-11-19.)
 - `@dateTimeNow` and `@lockExpiration` are sent as SQL `datetime`, so stored
   lock times are rounded to about 3 ms.
 - Times are written as `TimeProvider.GetUtcNow().DateTime`, which is a UTC

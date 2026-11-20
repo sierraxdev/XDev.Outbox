@@ -250,44 +250,222 @@ public class TesterOwnedSaveEventsAddedDuringSaveTests
         await AssertNothingMoreIsWritten(host, db, async);
     }
 
+    /// <summary>Exception thrown by the ChangeTracker.StateChanged handler installed by <see cref="ThrowOnFirstUserAccepted"/>.</summary>
+    public sealed class StateChangedHandlerException : Exception
+    {
+        public StateChangedHandlerException() : base("StateChanged handler failure")
+        {
+        }
+    }
+
     /// <summary>
-    /// PRE-EXISTING DEFECT (characterization; same before and after the fix, the buffer update still runs after
-    /// AcceptAllChanges): when AcceptAllChanges throws after an owned save committed (here a ChangeTracker.StateChanged
-    /// handler), the save throws and the buffer is not updated, so the committed event stays buffered, is not dispatched
-    /// in memory, and the next save writes it a second time (two committed rows for one event).
+    /// Makes AcceptAllChanges throw the first time a User entry becomes Unchanged (a ChangeTracker.StateChanged handler).
+    /// Returns a counter of how many times the handler threw.
+    /// </summary>
+    private static Func<int> ThrowOnFirstUserAccepted(AdvDbContext db)
+    {
+        var thrown = 0;
+        db.ChangeTracker.StateChanged += (_, e) =>
+        {
+            if (thrown == 0 && e.Entry.Entity is User && e.NewState == EntityState.Unchanged)
+            {
+                thrown++;
+                throw new StateChangedHandlerException();
+            }
+        };
+        return () => thrown;
+    }
+
+    /// <summary>The single outbox row's LockExpiresAt, read through a fresh context.</summary>
+    private static DateTime? SingleRowLockExpiresAt(CommitTesterHost host)
+    {
+        var (scope, db) = host.CreateScope();
+        using var _s = scope;
+        return Assert.Single(db.OutboxMessages.AsNoTracking().ToList()).LockExpiresAt;
+    }
+
+    /// <summary>
+    /// Bug A fix: when AcceptAllChanges throws after an owned save committed (here a ChangeTracker.StateChanged
+    /// handler), the save rethrows the original exception (plain EF parity), but the buffer was already trimmed: the
+    /// committed event is not written again by a later save. It is not dispatched in memory (left to the poller, which
+    /// delivers the committed row after its LockExpiresAt).
     /// </summary>
     [Theory]
     [MemberData(nameof(Async))]
-    public async Task PreExistingDefect_AcceptAllChangesThrowsAfterOwnedCommit_CommittedEventWrittenTwice(bool async)
+    public async Task AcceptAllChangesThrowsAfterOwnedCommit_CommittedEventNotRewritten_ExceptionPropagates(bool async)
     {
         using var host = CommitTesterHost.Create();
         var (scope, db) = host.CreateScope();
         using var _s = scope;
-        var thrown = false;
-        db.ChangeTracker.StateChanged += (_, e) =>
-        {
-            if (!thrown && e.Entry.Entity is User && e.NewState == EntityState.Unchanged)
-            {
-                thrown = true;
-                throw new InvalidOperationException("StateChanged handler failure");
-            }
-        };
+        var thrown = ThrowOnFirstUserAccepted(db);
         AddUserWithEvent(db, "a");
 
         var error = await Record.ExceptionAsync(() => Save.Invoke(db, async, true));
 
-        Assert.IsType<InvalidOperationException>(error);
+        Assert.IsType<StateChangedHandlerException>(error);
+        Assert.Equal(1, thrown());
         Assert.Single(host.Users());
         Assert.Single(host.UserRows());
+        Assert.Single(host.OutboxRows());
+        Assert.Empty(db.Outbox.GetEvents());
         Assert.Empty(host.Queue.Enqueued);
-        Assert.Single(db.Outbox.GetEvents());
+        var lockExpiresAt = SingleRowLockExpiresAt(host);
+        Assert.NotNull(lockExpiresAt);
+        Assert.True(lockExpiresAt > DateTime.UtcNow, "The committed row stays locked; the poller delivers it after LockExpiresAt.");
 
         db.ChangeTracker.AcceptAllChanges();
         await SaveUnrelated(db, async);
 
         Assert.Single(host.Users());
-        Assert.Equal(2, host.UserRows().Count);
+        Assert.Single(host.UserRows());
+        Assert.Single(host.OutboxRows());
+        Assert.Empty(host.Queue.Enqueued);
         AssertNoPhantomOrDoubleDispatch(host);
+        await AssertNothingMoreIsWritten(host, db, async);
+    }
+
+    /// <summary>
+    /// AcceptAllChanges throws after an owned commit while a SavingChanges handler added an event during that save: the
+    /// saved event is trimmed (written once), the during-save event stays buffered and is written once by the next save.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Async))]
+    public async Task AcceptAllChangesThrowsAfterOwnedCommit_DuringSaveEventKept_EachWrittenOnce(bool async)
+    {
+        using var host = CommitTesterHost.Create();
+        var (scope, db) = host.CreateScope();
+        using var _s = scope;
+        ThrowOnFirstUserAccepted(db);
+        PlainEvent? during = null;
+        var calls = 0;
+        db.SavingChanges += (_, _) => { if (calls++ == 0) db.Outbox.AddEvent(during = new PlainEvent { Text = "during save" }); };
+        AddUserWithEvent(db, "a");
+
+        var error = await Record.ExceptionAsync(() => Save.Invoke(db, async, true));
+
+        Assert.IsType<StateChangedHandlerException>(error);
+        Assert.Single(host.UserRows());
+        Assert.Equal(0, RowsWithText(host, "during save"));
+        Assert.Same(during, Assert.Single(db.Outbox.GetEvents()));
+        Assert.Empty(host.Queue.Enqueued);
+
+        db.ChangeTracker.AcceptAllChanges();
+        await SaveUnrelated(db, async);
+
+        Assert.Single(host.Users());
+        Assert.Single(host.UserRows());
+        Assert.Equal(1, RowsWithText(host, "during save"));
+        Assert.Equal(2, host.OutboxRows().Count);
+        Assert.Single(host.Queue.Enqueued);
+        AssertNoPhantomOrDoubleDispatch(host);
+        await AssertNothingMoreIsWritten(host, db, async);
+    }
+
+    /// <summary>AcceptAllChanges throws after an owned commit that wrote two events: both are trimmed, each written once.</summary>
+    [Theory]
+    [MemberData(nameof(Async))]
+    public async Task AcceptAllChangesThrowsAfterOwnedCommit_TwoEvents_BothTrimmed_EachWrittenOnce(bool async)
+    {
+        using var host = CommitTesterHost.Create();
+        var (scope, db) = host.CreateScope();
+        using var _s = scope;
+        ThrowOnFirstUserAccepted(db);
+        AddUserWithEvent(db, "a");
+        db.Outbox.AddEvent(new PlainEvent { Text = "second event" });
+
+        var error = await Record.ExceptionAsync(() => Save.Invoke(db, async, true));
+
+        Assert.IsType<StateChangedHandlerException>(error);
+        Assert.Single(host.UserRows());
+        Assert.Equal(1, RowsWithText(host, "second event"));
+        Assert.Equal(2, host.OutboxRows().Count);
+        Assert.Empty(db.Outbox.GetEvents());
+        Assert.Empty(host.Queue.Enqueued);
+
+        db.ChangeTracker.AcceptAllChanges();
+        await SaveUnrelated(db, async);
+
+        Assert.Single(host.Users());
+        Assert.Single(host.UserRows());
+        Assert.Equal(1, RowsWithText(host, "second event"));
+        Assert.Equal(2, host.OutboxRows().Count);
+        AssertNoPhantomOrDoubleDispatch(host);
+        await AssertNothingMoreIsWritten(host, db, async);
+    }
+
+    /// <summary>
+    /// Retrying execution strategy: AcceptAllChanges runs after the strategy returned (after the commit), so its failure
+    /// is not retried: one attempt, one commit, one business row, one outbox row; the event is not written again later.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Async))]
+    public async Task AcceptAllChangesThrowsAfterOwnedCommit_RetryingStrategy_NotReExecuted(bool async)
+    {
+        using var host = CommitTesterHost.Create(retrying: true);
+        var (scope, db) = host.CreateScope();
+        using var _s = scope;
+        ThrowOnFirstUserAccepted(db);
+        var savingCalls = 0;
+        db.SavingChanges += (_, _) => savingCalls++;
+        AddUserWithEvent(db, "a");
+        host.Commits.Reset();
+
+        var error = await Record.ExceptionAsync(() => Save.Invoke(db, async, true));
+
+        Assert.IsType<StateChangedHandlerException>(error);
+        Assert.Equal(1, savingCalls);
+        Assert.Equal(1, host.Commits.Count);
+        Assert.Single(host.Users());
+        Assert.Single(host.UserRows());
+        Assert.Single(host.OutboxRows());
+        Assert.Empty(db.Outbox.GetEvents());
+        Assert.Empty(host.Queue.Enqueued);
+
+        db.ChangeTracker.AcceptAllChanges();
+        await SaveUnrelated(db, async);
+
+        Assert.Single(host.Users());
+        Assert.Single(host.UserRows());
+        AssertNoPhantomOrDoubleDispatch(host);
+        await AssertNothingMoreIsWritten(host, db, async);
+    }
+
+    /// <summary>
+    /// Characterization (caller-transaction path, unaffected by the fix): AcceptAllChanges throws inside the caller
+    /// transaction after the message became pending; the save rethrows, the caller commits: one row, dispatched once
+    /// on commit, buffer empty, nothing written again later.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Async))]
+    public async Task AcceptAllChangesThrowsInCallerTransaction_ThenCommit_WrittenAndDispatchedOnce(bool async)
+    {
+        using var host = CommitTesterHost.Create();
+        var (scope, db) = host.CreateScope();
+        using var _s = scope;
+        ThrowOnFirstUserAccepted(db);
+        AddUserWithEvent(db, "a");
+
+        using (var tx = async ? await db.Database.BeginTransactionAsync() : db.Database.BeginTransaction())
+        {
+            var error = await Record.ExceptionAsync(() => Save.Invoke(db, async, true));
+            Assert.IsType<StateChangedHandlerException>(error);
+            Assert.Empty(host.Queue.Enqueued);
+            if (async) await tx.CommitAsync(); else tx.Commit();
+        }
+
+        Assert.Single(host.Users());
+        Assert.Single(host.UserRows());
+        Assert.Single(host.Queue.Enqueued);
+        Assert.Empty(db.Outbox.GetEvents());
+
+        db.ChangeTracker.AcceptAllChanges();
+        await SaveUnrelated(db, async);
+
+        Assert.Single(host.Users());
+        Assert.Single(host.UserRows());
+        Assert.Single(host.Queue.Enqueued);
+        AssertNoPhantomOrDoubleDispatch(host);
+        await AssertNothingMoreIsWritten(host, db, async);
     }
 
     // ---------------- Retrying execution strategy, failures at different points ----------------

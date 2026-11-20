@@ -181,8 +181,7 @@ public abstract class TableNameScenarioTests<TContext> where TContext : SmokeCon
 
     public static IEnumerable<object?[]> ClaimParameterCombinations()
     {
-        // itemsCount null is covered separately (ClaimWithoutItemsCountTests): it fails on any table.
-        foreach (var items in new int?[] { 2, 100 })
+        foreach (var items in new int?[] { null, 2, 100 })
         foreach (var locks in new[] { false, true })
         foreach (var max in new int?[] { null, 3 })
             yield return new object?[] { items, locks, max };
@@ -213,7 +212,15 @@ public abstract class TableNameScenarioTests<TContext> where TContext : SmokeCon
         var claim = Assert.Single(host.Faults.Commands);
         _output.WriteLine(claim.ToString());
 
-        Assert.Equal(expected, claimed);
+        if (itemsCount.HasValue)
+        {
+            Assert.Equal(expected, claimed);
+        }
+        else
+        {
+            // Without a count the claim has no ORDER BY: the order of the rows is unspecified.
+            Assert.Equal(expected.OrderBy(x => x), claimed.OrderBy(x => x));
+        }
         Assert.Equal((itemsCount.HasValue ? 1 : 0) + (withLock ? 1 : 0) + (maxAttemps.HasValue ? 1 : 0) + 1, claim.Parameters.Count);
         Assert.DoesNotContain(lockedFuture, claimed);
         var after = host.OutboxRows().ToDictionary(r => int.Parse(r.Id));
@@ -497,9 +504,9 @@ public class GetTableNameWithSchemeTests
 }
 
 /// <summary>
-/// IOutboxStore.GetAllAsync declares itemsCount = null as its default, but on SQL Server the claim SQL keeps
-/// "ORDER BY Id" inside the CTE without TOP, which SQL Server rejects (error 1033). Independent of the table name and
-/// pre-existing (same SQL before this fix); the hosted service always passes a count, so the poller is not affected.
+/// IOutboxStore.GetAllAsync declares itemsCount = null as its default: no limit, every eligible row is claimed. SQL
+/// Server rejects ORDER BY in a CTE without TOP (error 1033), so the claim orders only when it takes a count; the
+/// order of the rows claimed without a count is unspecified.
 /// </summary>
 public class ClaimWithoutItemsCountTests : IClassFixture<SmokeDatabaseFixture>
 {
@@ -507,7 +514,7 @@ public class ClaimWithoutItemsCountTests : IClassFixture<SmokeDatabaseFixture>
 
     public ClaimWithoutItemsCountTests(SmokeDatabaseFixture fixture) => _fixture = fixture;
 
-    [SqlServerTheory(Skip = "Pre-existing defect, found by the adversarial tests of fix-claim-sql-and-subscriber-errors: GetAllAsync with itemsCount = null (the interface default) throws SqlException 1033 'The ORDER BY clause is invalid in ... common table expressions, unless TOP, OFFSET or FOR XML is also specified' on SQL Server (net8.0-net11.0), for every lockExpiration/maxAttemps combination and every table name.")]
+    [SqlServerTheory]
     [InlineData(false, false)]
     [InlineData(false, true)]
     [InlineData(true, false)]
@@ -515,12 +522,37 @@ public class ClaimWithoutItemsCountTests : IClassFixture<SmokeDatabaseFixture>
     public async Task GetAllAsync_WithoutItemsCount_ClaimsEveryEligibleRow(bool withLock, bool withMaxAttemps)
     {
         using var host = SmokeHost<int, SmokeDbContext>.Create(_fixture);
-        var ids = Enumerable.Range(0, 3).Select(_ => StoreSeed.Row(host, null, null)).ToList();
+        var now = DateTime.UtcNow;
+        var free = Enumerable.Range(0, 3).Select(_ => StoreSeed.Row(host, null, null)).ToList();
+        var expired = StoreSeed.Row(host, now.AddMinutes(-10), 2);
+        var lockedFuture = StoreSeed.Row(host, now.AddMinutes(10), null);
+        var overMaxAttemps = StoreSeed.Row(host, null, 15);
+        var lockExpiration = withLock ? now.AddMinutes(5) : (DateTime?)null;
+
+        var expected = free.Append(expired).ToList();
+        if (!withMaxAttemps) expected.Add(overMaxAttemps);
+        var before = host.OutboxRows().ToDictionary(r => int.Parse(r.Id));
 
         await using var scope = host.CreateScope();
-        var claimed = await scope.Services.GetRequiredService<IOutboxStore<int>>()
-            .GetAllAsync(null, withLock ? DateTime.UtcNow.AddMinutes(5) : null, withMaxAttemps ? 15 : null);
+        var claimed = (await scope.Services.GetRequiredService<IOutboxStore<int>>()
+            .GetAllAsync(null, lockExpiration, withMaxAttemps ? 15 : null)).Select(x => x.Id).ToList();
 
-        Assert.Equal(ids, claimed.Select(x => x.Id));
+        Assert.Equal(expected.OrderBy(x => x), claimed.OrderBy(x => x));
+        Assert.DoesNotContain(lockedFuture, claimed);
+        if (withMaxAttemps) Assert.DoesNotContain(overMaxAttemps, claimed);
+
+        var after = host.OutboxRows().ToDictionary(r => int.Parse(r.Id));
+        Assert.Equal(before.Keys.OrderBy(x => x), after.Keys.OrderBy(x => x));
+        foreach (var (id, row) in after)
+        {
+            if (withLock && expected.Contains(id))
+            {
+                Assert.True(Math.Abs((row.LockExpiresAt!.Value - lockExpiration!.Value).TotalMilliseconds) < 4, $"Row {id} lock not set by the claim.");
+            }
+            else
+            {
+                Assert.Equal(before[id], row);
+            }
+        }
     }
 }

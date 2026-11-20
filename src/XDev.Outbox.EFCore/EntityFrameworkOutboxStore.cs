@@ -81,10 +81,21 @@ namespace XDev.Outbox.EFCore
                 queryBuilder.AppendLine("  WHERE (LockExpiresAt IS NULL OR LockExpiresAt < @dateTimeNow)");
             }
 
-            queryBuilder.Append("""
-                        ORDER BY Id
-                    )
-                """);
+            // SQL Server rejects ORDER BY in a CTE without TOP (error 1033): without a count every eligible row is
+            // claimed and the order is unspecified.
+            if (itemsCount.HasValue)
+            {
+                queryBuilder.Append("""
+                            ORDER BY Id
+                        )
+                    """);
+            }
+            else
+            {
+                queryBuilder.Append("""
+                        )
+                    """);
+            }
             queryBuilder.AppendLine();
 
             if (lockExpiration.HasValue)

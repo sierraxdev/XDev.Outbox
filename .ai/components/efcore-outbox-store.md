@@ -105,10 +105,14 @@ This path applies when there is no `Database.CurrentTransaction`.
 - The attempt runs inside `Database.CreateExecutionStrategy()`, in a
   `ReadCommitted` transaction, and commits.
 - After success:
-  1. Call `AcceptAllChanges()`, only when the flag is true.
-  2. Remove from the buffer only the events this save wrote (by reference
+  1. Remove from the buffer only the events this save wrote (by reference
      and multiplicity). Events added during the save stay buffered for the
      next save (since 2026-11-19).
+  2. Call `AcceptAllChanges()`, only when the flag is true. If it throws, the
+     exception propagates (plain-EF parity), step 3 is skipped and the outbox
+     poller delivers the committed rows after their `LockExpiresAt` (user
+     decision, 2026-11-19). The committed events have already left the
+     buffer, so no later save writes them again.
   3. Enqueue the messages. The sync path blocks on `EnqueueAsync`.
 - Dispatch happens in the save method, after acceptance. The interceptor
   ignores owned transactions; this is guarded by save depth and
@@ -291,12 +295,12 @@ constructor throws naming the registration methods.
   twice; nested `SaveChanges(false)` makes the outer save fail with
   `DbUpdateException`. Pinned by
   `PreExistingHazard_NestedSaveFromSavingChangesHandler_OuterEventDuplicatedOrSaveFails`.
-- **`AcceptAllChanges` throwing after an owned commit (open, pre-existing,
-  low).** `CompleteOwnedSave` accepts changes before updating the buffer; if
-  acceptance throws (e.g. a `ChangeTracker.StateChanged` handler), the
-  committed event is not dispatched in memory, stays buffered and is written
-  again by the next save. Pinned by
-  `PreExistingDefect_AcceptAllChangesThrowsAfterOwnedCommit_CommittedEventWrittenTwice`.
+- **`AcceptAllChanges` throwing after an owned commit.** Used to leave the
+  committed event buffered, so the next save wrote it again (fixed
+  2026-11-19; see the owned-transaction steps above). Business entries that
+  acceptance did not reach stay Added, as in plain EF. Tests:
+  `AcceptAllChangesThrowsAfterOwnedCommit_*` in
+  `TesterOwnedSaveEventsAddedDuringSaveTests`.
 - Buffered events are matched to saved messages by reference, not by value:
   a value-equal record instance is a separate event.
 - **Commit outcome unknown.** If the server commits but EF reports a failed
