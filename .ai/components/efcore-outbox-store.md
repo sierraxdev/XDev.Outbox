@@ -246,23 +246,35 @@ constructor throws naming the registration methods.
   rollback fails (doomed transaction, e.g. `XACT_ABORT`, SQL error 3903), or
   no savepoint existed and EF's save had completed, warning EventId 41002
   `XDev.Outbox.EFCore.CallerTransactionSaveNotUndone` is logged.
-- **Explicit rollback after a failed save loses the event (open, needs a
-  decision).** After a failed caller-transaction save the business entity is
-  still Added but no message is pending. An explicit `Rollback()` drops the
-  never-saved event, so a later save in a new transaction commits the entity
-  without an outbox row. Disposing the transaction without `Rollback()` keeps
-  the event. Pinned by
-  `FailedSave_CallerRollsBackExplicitly_RetryInNewTransactionCommitsUserWithoutOutboxRow`.
-- **Retry after EF's own save fails partway (open, pre-existing).** If an
-  earlier command of EF's save ran (outbox INSERT got a key) and a later one
-  failed, EF reverts the entry to a temporary key but its identity map keeps
-  the generated key. `RecoverFailedAttempt` detaches through the cached
-  `EntityEntry` (no DetectChanges), leaving a stale identity-map entry. On
-  SQLite the rolled-back rowid is reused, so the retry throws "cannot be
-  tracked ... same key" (owned, caller and retrying-strategy paths). Latent on
-  SQL Server (identity values not reused). Plain-EF experiment: detaching via
-  a fresh `context.Entry(entity)` avoids it. Skipped tests in
-  `CallerTransactionPartialSave/RetryAfterPartialEfSaveTests.cs`.
+- **Never-saved events on transaction end (2026-11-19).** Events in the
+  buffer with no pending message in the ended transaction (failed saves,
+  events added before the transaction or after its last save) stay buffered
+  when the transaction ends without commit: explicit `Rollback()`, failed
+  commit, failed rollback or dispose all behave the same. (Before, an
+  explicit rollback dropped them, so a retry committed the entity without
+  its outbox row.) Consequence: if the app abandons the unit of work after a
+  rollback (`ChangeTracker.Clear()`, re-running logic), it must also call
+  `Outbox.ClearEvents()`, or the kept event is persisted by the next save
+  without its business change (payload keys 0). Pinned by
+  `TesterRollbackKeepTests`.
+- **Commit drops never-saved events (open, needs a decision).** A commit
+  removes buffered events that were not saved in it: event added before
+  `BeginTransaction` and commit without a save; event added after the last
+  save; failed save then commit; never-saved events kept by an earlier
+  rollback/dispose and a later transaction that commits without saving them.
+  The business changes stay pending, so a later save commits them without an
+  outbox row (silent event loss). Pinned by
+  `NeverSavedEventsOnTransactionEndTests.NeverSavedEventThenCommit_...`.
+- **Recovery re-keys outbox entries before detaching (2026-11-19).** When
+  EF's own save fails after an earlier command produced a generated outbox
+  key, EF reverts the entry to a temporary key but its identity map keeps
+  the generated one. `RecoverFailedAttempt` calls `EntityEntry.DetectChanges()`
+  on each outbox entry before detaching it (works with
+  `AutoDetectChangesEnabled=false`, touches only that entry), so the retry no
+  longer throws "cannot be tracked ... same key" (SQLite reuses rowids;
+  latent on SQL Server). Business entries are left as plain EF leaves them:
+  with auto-detect off the app must call `ChangeTracker.DetectChanges()`
+  before retrying, as with plain EF.
 - **Guarded setters on setter-only keys.** A setter that rejects the default
   value fails flag=false saves and failure recovery. The failure surfaces as an
   `AggregateException`.
@@ -276,7 +288,8 @@ constructor throws naming the registration methods.
   dispatched twice.
 - **Dependency on EF internals.** Correctness depends on undocumented EF
   change-tracker behavior (see `.ai/decisions/001-deferred-acceptance-and-payload-projection.md`)
-  and on `ContextId.Lease` incrementing per pool lease (decision 002).
+  on `ContextId.Lease` incrementing per pool lease (decision 002), and on
+  `EntityEntry.DetectChanges()` re-keying the identity map after a failed save.
 - **SQL Server (verified 2026-11-19, LocalDB 17.0, net8–net11,
   `tests/XDev.Outbox.EFCore.SqlServer.Tests`).** Confirmed: identity values on
   execution-strategy and application retries (no FK errors, final ids in

@@ -130,11 +130,11 @@ public class TesterDoomedTransactionTests : IClassFixture<SmokeDatabaseFixture>
         Assert.Empty(host.OutboxRows());
         Assert.Empty(host.Queue.Enqueued);
 
-        // B1 (pre-existing): the failed save left no pending message, so the caller's rollback dropped the event as
-        // never saved, while the user stays Added in the tracker: the application must add the event again.
-        Assert.Empty(db.Outbox.GetEvents());
+        // The failed save left no pending message, so its event was never saved: the caller's rollback keeps it, and
+        // it follows the user that stays Added in the tracker (before fix-rollback-event-loss, it was dropped and the
+        // application had to add it again).
+        Assert.Single(db.Outbox.GetEvents());
         user.Email = "fixed@test";
-        db.Outbox.AddEvent(new UserCreated { User = user });
         await using (var retry = await db.Database.BeginTransactionAsync())
         {
             await db.SaveChangesAsync();
@@ -254,7 +254,7 @@ public class TesterDoomedTransactionTests : IClassFixture<SmokeDatabaseFixture>
         Assert.Equal(2, attempts);
         // The failed attempt's transaction is disposed without an explicit rollback: the next save detects it as
         // stale, which keeps never-saved events, so the retry saves the event with its user. (An explicit Rollback
-        // drops it instead: see TesterAdversarialSavepointTests.FailedSave_CallerRollsBackExplicitly_...)
+        // keeps it too: see TesterAdversarialSavepointTests.FailedSave_CallerRollsBackOrDisposes_...)
         Assert.Equal(1, eventsBufferedAtRetry);
         Assert.Single(log.WithEventId(NotUndoneEventId));
         AssertCommittedAndDispatchedOnce(host, "fixed@test");

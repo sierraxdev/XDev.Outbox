@@ -42,8 +42,9 @@ namespace XDev.Outbox.EFCore
         /// (and any stale ones) without dispatching them, and updates the event buffer: events saved
         /// whose business changes are still pending (acceptAllChangesOnSuccess = false and not accepted by a later
         /// save) stay buffered, and so do events kept by an earlier release (in another transaction or by a rollback to
-        /// a savepoint) whose business changes are still pending; events of accepted changes and events never saved are
-        /// removed.
+        /// a savepoint) whose business changes are still pending, and events never saved (no pending message: added
+        /// after the last save or before the transaction, or their save failed), as when the transaction is disposed
+        /// without a rollback; events of accepted changes are removed.
         /// </summary>
         void EndTransactionWithoutCommit(Guid transactionId);
 

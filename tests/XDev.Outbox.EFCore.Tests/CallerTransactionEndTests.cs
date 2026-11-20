@@ -129,13 +129,14 @@ public class CallerTransactionEndTests
     }
 
     /// <summary>
-    /// Documents the choice for events added to the buffer but never saved in the transaction: a rollback clears
-    /// them (unchanged behavior); only events saved with acceptAllChangesOnSuccess = false stay buffered.
+    /// Events added to the buffer but never saved in the transaction are kept by a rollback (as by a dispose without
+    /// rollback), together with events saved with acceptAllChangesOnSuccess = false. (Before
+    /// fix-rollback-event-loss-and-retry-identity-conflict, the rollback cleared never-saved events.)
     /// </summary>
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task AmbientSaveNotAccepted_CallerRollsBack_KeepsSavedEventAndClearsNeverSavedEvent(bool async)
+    public async Task AmbientSaveNotAccepted_CallerRollsBack_KeepsSavedEventAndNeverSavedEvent(bool async)
     {
         using var host = OutboxTestHost.Create();
         using var scope = host.CreateScope();
@@ -143,16 +144,17 @@ public class CallerTransactionEndTests
         var user = new User { Email = "a@test" };
         scope.Db.Users.Add(user);
         var saved = new UserCreated { User = user };
+        var never = new UserCreated();
         scope.Outbox.AddEvent(saved);
 
         using (var tx = await Begin(scope.Db, async))
         {
             await Save.Invoke(scope.Db, async, acceptAllChangesOnSuccess: false);
-            scope.Outbox.AddEvent(new UserCreated());
+            scope.Outbox.AddEvent(never);
             if (async) await tx.RollbackAsync(); else tx.Rollback();
         }
 
-        Assert.Same(saved, Assert.Single(scope.Outbox.GetEvents()));
+        Assert.Equal(new object[] { saved, never }, scope.Outbox.GetEvents());
         Assert.Empty(host.Queue.Enqueued);
     }
 

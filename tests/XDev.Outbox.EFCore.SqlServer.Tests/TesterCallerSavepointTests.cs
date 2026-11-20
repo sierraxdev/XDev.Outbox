@@ -14,7 +14,7 @@ namespace XDev.Outbox.EFCore.SqlServer.Tests;
 /// Adversarial (tester) checks of the D5 fix on SQL Server, where ReleaseSavepoint is a no-op: every SAVE TRANSACTION
 /// of the transaction stays, names accumulate, and ROLLBACK TRANSACTION name targets the most recent savepoint of
 /// that name. Also: external transactions (UseTransaction), pooled contexts, Guid keys, savepoint counts per save,
-/// cancellation, and the pre-existing identity-map defect (item 8) on SQL Server.
+/// cancellation, and the identity map after a partial EF save (item 8) on SQL Server.
 /// </summary>
 public class TesterCallerSavepointTests : IClassFixture<SmokeDatabaseFixture>
 {
@@ -397,20 +397,91 @@ public class TesterCallerSavepointTests : IClassFixture<SmokeDatabaseFixture>
         AssertCommittedAndDispatchedOnce(host, "cancel@test");
     }
 
-    // ---------------- 8. Pre-existing identity-map defect on SQL Server ----------------
+    // ---------------- Never-saved events on an end without commit (fix-rollback-event-loss) ----------------
+
+    public enum EndMode
+    {
+        Rollback,
+        Dispose,
+        FailedCommit,
+    }
+
+    /// <summary>
+    /// One transaction: a flag=true save (accepted: its event is dropped), a flag=false save (pending: kept), a save
+    /// that fails after its writes (undone by the library's savepoint; never saved: kept) and an event added after the
+    /// last save (never saved: kept). Explicit Rollback, failed commit and dispose give the same outcome: a new
+    /// transaction commits the pending users each with its outbox row, dispatched once.
+    /// </summary>
+    [SqlServerTheory]
+    [InlineData(EndMode.Rollback, false)]
+    [InlineData(EndMode.Rollback, true)]
+    [InlineData(EndMode.Dispose, false)]
+    [InlineData(EndMode.Dispose, true)]
+    [InlineData(EndMode.FailedCommit, false)]
+    [InlineData(EndMode.FailedCommit, true)]
+    public async Task SavedAndNeverSavedEvents_EndWithoutCommit_SameOutcomeForEveryEnd(EndMode end, bool async)
+    {
+        using var host = CreateHost();
+        await using var scope = host.CreateScope();
+        var db = scope.Db;
+
+        var tx = await Begin(db, async);
+        var accepted = AddUserWithEvent(db, "accepted@test", "a1");
+        await Save.Invoke(db, async ? SaveCall.SaveChangesAsyncTrue : SaveCall.SaveChangesTrue);
+        AddUserWithEvent(db, "pending@test", "p1");
+        await Save.Invoke(db, async ? SaveCall.SaveChangesAsyncFalse : SaveCall.SaveChangesFalse);
+        var failed = AddUserWithEvent(db, "failed@test", "f1");
+        host.Faults.FailCommands(SqlMatch.IsOutboxPayloadUpdate, FaultTiming.AfterExecution);
+        Assert.IsType<InjectedTransientException>(await Record.ExceptionAsync(() => Save.Invoke(db, async ? SaveCall.SaveChangesAsyncFalse : SaveCall.SaveChangesFalse)));
+        Assert.Equal(EntityState.Added, db.Entry(failed).State);
+        AddUserWithEvent(db, "later@test", "l1");
+        var buffered = db.Outbox.GetEvents().ToList();
+        Assert.Equal(4, buffered.Count);
+
+        if (end == EndMode.Rollback)
+        {
+            if (async) await tx.RollbackAsync(); else tx.Rollback();
+        }
+        if (end == EndMode.FailedCommit)
+        {
+            host.Faults.FailCommits();
+            Assert.NotNull(await Record.ExceptionAsync(() => Commit(tx, async)));
+            Assert.Equal(1, host.Faults.CommitFailuresFired);
+        }
+        if (async) await tx.DisposeAsync(); else tx.Dispose();
+
+        Assert.Empty(host.Database.Users());
+        Assert.Empty(host.Queue.Enqueued);
+        Assert.Equal(end == EndMode.Dispose ? buffered : buffered.Skip(1).ToList(), db.Outbox.GetEvents());
+        Assert.Equal(EntityState.Unchanged, db.Entry(accepted).State); // accepted: not saved again (plain EF)
+        db.Entry(accepted).State = EntityState.Detached; // its key was never committed
+        foreach (var order in accepted.Orders) db.Entry(order).State = EntityState.Detached;
+
+        await using (var retry = await Begin(db, async))
+        {
+            await Save.Invoke(db, async);
+            await Commit(retry, async);
+        }
+
+        AssertCommittedAndDispatchedOnce(host, "pending@test", "failed@test", "later@test");
+        Assert.Empty(db.Outbox.GetEvents());
+    }
+
+    // ---------------- 8. Identity map after a partial EF save on SQL Server ----------------
 
     /// <summary>
     /// Item 8 on SQL Server: EF's save fails after the Users+OutboxMessages batch ran (the Orders batch fails), so EF
-    /// discards the outbox row's identity value. The library's detach leaves that value in the identity map (stale
-    /// entry, as on SQLite), but SQL Server does not reuse identity values after a rollback, so the retry gets a new
-    /// value and succeeds: the defect is latent on SQL Server identity keys.
+    /// discards the outbox row's identity value. The library's recovery detects the key change before detaching, so
+    /// no stale outbox entry is left in the identity map (before
+    /// fix-rollback-event-loss-and-retry-identity-conflict it was, latent here because SQL Server does not reuse
+    /// identity values after a rollback); the retry persists and dispatches once.
     /// </summary>
     [SqlServerTheory]
     [InlineData(false, false)]
     [InlineData(false, true)]
     [InlineData(true, false)]
     [InlineData(true, true)]
-    public async Task EfSaveFailsAfterOutboxBatchRan_StaleIdentityMapEntryButRetrySucceeds(bool callerTransaction, bool async)
+    public async Task EfSaveFailsAfterOutboxBatchRan_NoStaleIdentityMapEntryAndRetrySucceeds(bool callerTransaction, bool async)
     {
         using var host = CreateHost();
         await using var scope = host.CreateScope();
@@ -429,8 +500,7 @@ public class TesterCallerSavepointTests : IClassFixture<SmokeDatabaseFixture>
             var key = db.Model.FindEntityType(typeof(OutboxMessage<int>))!.FindPrimaryKey()!;
             var stale = Enumerable.Range(1, 1000).Select(i => stateManager.TryGetEntry(key, new object[] { i })).FirstOrDefault(e => e != null);
             _output.WriteLine($"Stale outbox identity-map entry after the failed save: {(stale == null ? "none" : stale.EntityState.ToString())}");
-            Assert.NotNull(stale);
-            Assert.Equal(EntityState.Detached, stale!.EntityState);
+            Assert.Null(stale);
 
             Assert.Null(await Record.ExceptionAsync(() => Save.Invoke(db, async)));
             if (tx != null) await Commit(tx, async);

@@ -231,8 +231,7 @@ public class CallerTransactionPartialSaveTests : IClassFixture<SmokeDatabaseFixt
         Assert.Empty(host.Database.Users());
         Assert.Empty(host.OutboxRows());
         Assert.Empty(host.Queue.Enqueued);
-        Assert.Empty(db.Outbox.GetEvents()); // B1: never saved, dropped by the rollback
-        db.Outbox.AddEvent(new UserCreated { User = user });
+        Assert.Single(db.Outbox.GetEvents()); // never saved: kept by the rollback
 
         await using (var tx = await Begin(db, async))
         {

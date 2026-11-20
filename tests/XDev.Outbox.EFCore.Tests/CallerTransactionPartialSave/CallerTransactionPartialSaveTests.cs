@@ -418,9 +418,9 @@ public class CallerTransactionPartialSaveTests
         Assert.Equal(0, host.Scalar("SELECT COUNT(*) FROM \"Users\""));
         Assert.Empty(host.OutboxRows());
         Assert.Empty(host.Queue.Enqueued);
-        // B1: the failed save left no pending message, so its event counts as never saved and the rollback drops it.
-        Assert.Empty(outbox.GetEvents());
-        outbox.AddEvent(new UserCreated { User = user });
+        // The failed save left no pending message, so its event was never saved: the rollback keeps it (it follows
+        // the still-Added user).
+        Assert.Single(outbox.GetEvents());
 
         using (var tx = await Begin(db, async))
         {
@@ -466,8 +466,7 @@ public class CallerTransactionPartialSaveTests
 
         Assert.Equal(0, host.Scalar("SELECT COUNT(*) FROM \"Users\""));
         Assert.Empty(host.OutboxRows());
-        Assert.Empty(outbox.GetEvents()); // B1: never saved, dropped by the rollback
-        outbox.AddEvent(new UserCreated { User = user });
+        Assert.Single(outbox.GetEvents()); // never saved: kept by the rollback
 
         using (var tx = await Begin(db, async))
         {

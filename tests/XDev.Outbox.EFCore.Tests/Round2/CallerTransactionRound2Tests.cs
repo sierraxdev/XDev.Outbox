@@ -175,12 +175,13 @@ public class CallerTransactionRound2Tests
     }
 
     /// <summary>
-    /// Documents the asymmetry for events added after the save but never saved: rollback clears them, while a
-    /// dispose without rollback keeps them (and the next save writes them).
+    /// Events added after the save but never saved are kept by a rollback and by a dispose without rollback alike
+    /// (the next save writes them). (Before fix-rollback-event-loss-and-retry-identity-conflict, the rollback
+    /// dropped them: an asymmetry with the dispose.)
     /// </summary>
     [Theory]
     [MemberData(nameof(AsyncFlag))]
-    public async Task NeverSavedEvent_RollbackDropsIt_DisposeKeepsIt(bool async, bool flag)
+    public async Task NeverSavedEvent_RollbackAndDisposeBothKeepIt(bool async, bool flag)
     {
         using var host = R2Host.Create();
 
@@ -198,7 +199,7 @@ public class CallerTransactionRound2Tests
                 outbox.AddEvent(never);
                 await R2Save.Rollback(tx, async);
             }
-            Assert.Equal(flag ? Array.Empty<object>() : new object[] { saved }, outbox.GetEvents());
+            Assert.Equal(flag ? new object[] { never } : new object[] { saved, never }, outbox.GetEvents());
         }
 
         // Dispose without commit/rollback; detection happens on the next save.

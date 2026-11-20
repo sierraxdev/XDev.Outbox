@@ -56,12 +56,14 @@ namespace XDev.Outbox.EFCore
     //   - committing: unconfirmed messages are checked again; if that fails, a warning (UnconfirmedAtCommitEventId) is logged.
     //   - committed: confirmed messages are dispatched; their events and never-saved events leave the buffer.
     //   - ended without commit (rollback, failed commit/rollback) and stale (another transaction is current or
-    //     committed, i.e. the earlier one was disposed): every pending message is released.
+    //     committed, i.e. the earlier one was disposed): every pending message is released. Never-saved events
+    //     (buffered events with no pending message: added after the last save or before the transaction, or whose
+    //     save failed) stay buffered for every end without commit; only a commit drops them.
     //   - released: no dispatch. Accepted -> its event leaves the buffer (the changes will not be saved again).
     //     Not accepted -> its event stays buffered and is recorded in _releasedNotAcceptedEvents.
     // _releasedNotAcceptedEvents (by reference and multiplicity) keeps those events distinguishable from never-saved
-    // events, so a later end of another transaction without a save does not drop them (never-saved events are dropped
-    // on commit/rollback). An entry leaves the list when its event is saved again (pending again, or persisted by an
+    // events, so a later commit of another transaction without a save does not drop them (never-saved events are
+    // dropped on commit). An entry leaves the list when its event is saved again (pending again, or persisted by an
     // owned save), when a flag = true save accepts the business changes, or when the event is no longer in the buffer.
     public abstract class OutboxDbContext<TKey, TContext> : DbContext, IOutboxTransactionParticipant<TKey> where TKey : struct where TContext : DbContext, IOutboxDbContext<TKey>
     {
@@ -423,7 +425,9 @@ namespace XDev.Outbox.EFCore
         {
             EnsureCurrentLease();
             // Only one transaction can be current per context, so anything pending for another id has ended too.
-            ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList(), keepUnsavedEvents: false);
+            // Never-saved events stay buffered with their still-pending business changes, as when the transaction is
+            // disposed without a rollback (stale detection at the next save).
+            ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList(), keepUnsavedEvents: true);
         }
 
         void IOutboxTransactionParticipant<TKey>.RolledBackToSavepoint(Guid transactionId)
@@ -724,9 +728,11 @@ namespace XDev.Outbox.EFCore
         /// again with them; when they were accepted they will not be saved again, so the event is removed.
         /// Events of <paramref name="committed"/> messages are removed. Events of the other pending messages are kept
         /// (their transaction decides). Events kept earlier for released, not accepted messages
-        /// (<c>_releasedNotAcceptedEvents</c>) are kept. Other events (never saved) are kept only when
-        /// <paramref name="keepUnsavedEvents"/> is true. <c>_releasedNotAcceptedEvents</c> is rebuilt from the
-        /// buffer, so entries whose event the application removed from the buffer are forgotten.
+        /// (<c>_releasedNotAcceptedEvents</c>) are kept. Other events (never saved: no pending message, e.g. added
+        /// after the last save or before the transaction, or their save failed) are kept only when
+        /// <paramref name="keepUnsavedEvents"/> is true (every end without commit); a commit removes them.
+        /// <c>_releasedNotAcceptedEvents</c> is rebuilt from the buffer, so entries whose event the application
+        /// removed from the buffer are forgotten.
         /// </summary>
         private void UpdateBuffer(IReadOnlyList<SavedOutboxMessage> released, IReadOnlyList<SavedOutboxMessage> committed, bool keepUnsavedEvents)
         {
@@ -935,18 +941,31 @@ namespace XDev.Outbox.EFCore
         /// attempt's outbox entries are detached and the generated values captured before the attempt (temporary
         /// keys/foreign keys, unset store-generated values) are restored. Every step is attempted; when a step fails
         /// the original exception and the recovery failures are thrown together.
+        /// When EF's own save fails after an earlier command of it ran, EF puts the temporary key back on the entries
+        /// whose store-generated key it discards, but its identity map keeps them under the discarded key until
+        /// changes are detected. Detaching removes an entry under its current (temporary) key, so the key change of
+        /// each outbox entry is detected first (explicitly: AutoDetectChangesEnabled may be false); otherwise the
+        /// discarded key stays in the identity map and a retry that gets the same key (SQLite reuses rowids) fails.
         /// </summary>
         private static void RecoverFailedAttempt(SaveAttempt attempt, Exception failure)
         {
             var errors = new List<Exception>();
             foreach (var entry in attempt.OutboxEntries)
             {
+                if (entry.State == EntityState.Detached) continue;
+
                 try
                 {
-                    if (entry.State != EntityState.Detached)
-                    {
-                        entry.State = EntityState.Detached;
-                    }
+                    entry.DetectChanges();
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                }
+
+                try
+                {
+                    entry.State = EntityState.Detached;
                 }
                 catch (Exception ex)
                 {

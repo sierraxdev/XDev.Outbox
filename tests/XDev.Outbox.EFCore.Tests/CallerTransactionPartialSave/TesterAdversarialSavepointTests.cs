@@ -463,8 +463,7 @@ public class TesterAdversarialSavepointTests
         Assert.Empty(host.Users());
         Assert.Empty(host.OutboxRows());
         host.Sabotage.Reset();
-        Assert.Empty(outbox.GetEvents()); // B1: never saved, dropped by the rollback
-        outbox.AddEvent(new UserCreated { User = user });
+        Assert.Single(outbox.GetEvents()); // never saved: kept by the rollback, follows the still-Added user
 
         using (var tx = await Begin(db, async))
         {
@@ -540,21 +539,21 @@ public class TesterAdversarialSavepointTests
         AssertCommittedAndDispatchedOnce(host, "a");
     }
 
-    // ---------------- Pre-existing B1 hazard surfaced by the 41002 guidance ----------------
+    // ---------------- Never-saved events on a transaction end without commit (fix-rollback-event-loss) ----------------
 
     /// <summary>
-    /// OBSERVED behavior, pinned as a hazard (pre-existing, not introduced by D5; reported to the orchestrator): after a
-    /// failed save in a caller transaction the tracker is restored (the user stays Added) but no pending message
-    /// exists, so an explicit Rollback (what warning 41002 tells the caller to do) drops the event as "never saved".
-    /// Saving again in a new transaction then commits the user WITHOUT an outbox row. Disposing the transaction
-    /// without an explicit Rollback keeps the event instead (stale detection at the next save keeps never-saved events).
+    /// After a failed save in a caller transaction the tracker is restored (the user stays Added) and no message is
+    /// pending, so the event is never saved. An explicit Rollback (what warning 41002 tells the caller to do) keeps it
+    /// buffered exactly like a dispose without Rollback, so saving again in a new transaction commits the user WITH its
+    /// outbox row, dispatched once. (Before the fix, the explicit Rollback dropped the event and the retry committed
+    /// the user without an outbox row.)
     /// </summary>
     [Theory]
     [InlineData(false, false)]
     [InlineData(false, true)]
     [InlineData(true, false)]
     [InlineData(true, true)]
-    public async Task FailedSave_CallerRollsBackExplicitly_RetryInNewTransactionCommitsUserWithoutOutboxRow(bool explicitRollback, bool async)
+    public async Task FailedSave_CallerRollsBackOrDisposes_RetryInNewTransactionCommitsUserWithOutboxRowDispatchedOnce(bool explicitRollback, bool async)
     {
         using var host = TesterSavepointHost.Create();
         var (scope, db, outbox) = host.CreateScope();
@@ -569,6 +568,7 @@ public class TesterAdversarialSavepointTests
         if (explicitRollback)
         {
             if (async) await tx.RollbackAsync(); else tx.Rollback();
+            Assert.Single(outbox.GetEvents()); // never saved: kept by the rollback
         }
         if (async) await tx.DisposeAsync(); else tx.Dispose();
 
@@ -578,17 +578,7 @@ public class TesterAdversarialSavepointTests
             await Commit(retry, async);
         }
 
-        Assert.Single(host.Users());
-        if (explicitRollback)
-        {
-            // The hazard: business row committed, its event lost.
-            Assert.Empty(host.OutboxRows());
-            Assert.Empty(host.Queue.Enqueued);
-        }
-        else
-        {
-            AssertCommittedAndDispatchedOnce(host, "a");
-        }
+        AssertCommittedAndDispatchedOnce(host, "a");
     }
 
     // ---------------- 6. Existence check after a failed-then-retried save ----------------

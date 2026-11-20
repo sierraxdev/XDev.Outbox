@@ -50,10 +50,18 @@ Each rule is labeled:
   messages are enqueued. After a failure, the buffer is kept.
 - [Confirmed] Caller-owned transaction:
   - On commit, committed and never-saved events are removed from the buffer.
-  - If the transaction ends without commit (rollback, failed commit, or
-    dispose), the events follow their business changes:
+    [Observed, intent unknown] Dropping never-saved events on commit can lose
+    events whose business changes are still pending (open item).
+  - If the transaction ends without commit (rollback, failed commit, failed
+    rollback, or dispose; all behave the same since 2026-11-19), the events
+    follow their business changes:
     - saved with `acceptAllChangesOnSuccess=false`: the events stay buffered;
-    - saved with `true`: the events are dropped.
+    - saved with `true`: the events are dropped;
+    - never saved in it (failed save, added before or after the saves): the
+      events stay buffered.
+  - An app that abandons its unit of work after a rollback must call
+    `dbContext.Outbox.ClearEvents()`; otherwise the kept events are persisted
+    by the next save without their business changes.
   - Rows undone by `RollbackToSavepoint` are not dispatched.
   - Details are in `components/efcore-outbox-store.md`.
 - [Confirmed] Outbox entities are not left tracked by the DbContext after a

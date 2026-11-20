@@ -225,12 +225,16 @@ public class ReleasedEventTrackingTests
 
     /// <summary>
     /// No phantom: the application clears the buffer of a released event, an accepting save without events accepts
-    /// the pending changes, then the same instance is re-added: it is a fresh (never-saved) event, dropped by a
-    /// rollback like any other never-saved event.
+    /// the pending changes, then the same instance is re-added: it is a fresh (never-saved) event. A rollback keeps it
+    /// like any other never-saved event (since fix-rollback-event-loss-and-retry-identity-conflict; before, it was
+    /// dropped); a commit drops it like any other never-saved event (a phantom released entry would keep it).
     /// </summary>
     [Theory]
-    [MemberData(nameof(Async))]
-    public async Task ReleasedEvent_ClearedThenChangesAcceptedThenReAdded_TreatedAsNeverSaved(bool async)
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ReleasedEvent_ClearedThenChangesAcceptedThenReAdded_TreatedAsNeverSaved(bool commit, bool async)
     {
         using var host = OutboxTestHost.Create();
         using var scope = host.CreateScope();
@@ -243,10 +247,18 @@ public class ReleasedEventTrackingTests
         {
             await Save.Invoke(scope.Db, async, acceptAllChangesOnSuccess: true);
             scope.Outbox.AddEvent(evt);
-            if (async) await tx.RollbackAsync(); else tx.Rollback();
+            if (commit)
+            {
+                if (async) await tx.CommitAsync(); else tx.Commit();
+            }
+            else
+            {
+                if (async) await tx.RollbackAsync(); else tx.Rollback();
+            }
         }
 
-        Assert.Empty(scope.Outbox.GetEvents());
+        if (commit) Assert.Empty(scope.Outbox.GetEvents());
+        else Assert.Same(evt, Assert.Single(scope.Outbox.GetEvents()));
         Assert.Equal(0, host.Count("OutboxMessages"));
         Assert.Empty(host.Queue.Enqueued);
     }
