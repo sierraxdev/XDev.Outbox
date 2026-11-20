@@ -66,16 +66,12 @@ namespace XDev.Outbox.EFCore
     //   - ended without commit (rollback, failed commit/rollback) and stale (another transaction is current or
     //     committed, i.e. the earlier one was disposed): every pending message is released.
     //   - released: no dispatch. Accepted -> its event leaves the buffer (the changes will not be saved again).
-    //     Not accepted -> its event stays buffered and is recorded in _releasedNotAcceptedEvents.
+    //     Not accepted -> its event stays buffered and is saved again with its still-pending business changes.
     // Never-saved events (buffered events with no pending message of the ended transaction: added after the last save
     // or before the transaction, kept by an earlier end, or whose save failed) stay buffered for every end, commit
     // included, with their still-pending business changes. An event therefore leaves the buffer only when it is
     // committed (caller or owned save), when its saved, accepted message is released (above), by Outbox.ClearEvents(),
     // or at the end of the context/pool lease.
-    // _releasedNotAcceptedEvents (by reference and multiplicity) records the released, not accepted events. Since
-    // never-saved events are kept on commit too, it no longer changes which events stay buffered. An entry leaves the
-    // list when its event is saved again (pending again, or persisted by an owned save), when a flag = true save
-    // accepts the business changes, or when the event is no longer in the buffer.
     public abstract class OutboxDbContext<TKey, TContext> : DbContext, IOutboxTransactionParticipant<TKey> where TKey : struct where TContext : DbContext, IOutboxDbContext<TKey>
     {
         // Upper bound of ids per existence query after a rollback to a savepoint (keeps parameter counts low).
@@ -108,8 +104,6 @@ namespace XDev.Outbox.EFCore
         // Messages saved inside a caller-owned transaction; dispatched by the interceptor when that transaction commits.
         private readonly List<SavedOutboxMessage> _pendingOutboxMessages = new List<SavedOutboxMessage>();
         private Guid? _pendingTransactionId;
-        // Buffered events of released, not accepted messages (see the state machine above); by reference, with duplicates.
-        private readonly List<object> _releasedNotAcceptedEvents = new List<object>();
         private bool _outboxSaveInProgress;
         // > 0 while one of the SaveChanges overrides runs; savepoints EF creates and rolls back inside a save are ignored.
         private int _saveDepth;
@@ -373,7 +367,6 @@ namespace XDev.Outbox.EFCore
             _outbox.Events.Clear();
             _pendingOutboxMessages.Clear();
             _pendingTransactionId = null;
-            _releasedNotAcceptedEvents.Clear();
             _outboxSaveInProgress = false;
             _saveDepth = 0;
         }
@@ -433,7 +426,7 @@ namespace XDev.Outbox.EFCore
             var stale = isCurrent ? new List<SavedOutboxMessage>() : _pendingOutboxMessages.ToList();
 
             // Events never saved in the committed transaction stay buffered with their still-pending business changes.
-            UpdateBuffer(released: stale, committed: committed, keepUnsavedEvents: true);
+            UpdateBuffer(released: stale, committed: committed);
             _pendingOutboxMessages.Clear();
             _pendingTransactionId = null;
 
@@ -447,7 +440,7 @@ namespace XDev.Outbox.EFCore
             // Only one transaction can be current per context, so anything pending for another id has ended too.
             // Never-saved events stay buffered with their still-pending business changes, as when the transaction is
             // disposed without a rollback (stale detection at the next save).
-            ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList(), keepUnsavedEvents: true);
+            ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList());
         }
 
         void IOutboxTransactionParticipant<TKey>.RolledBackToSavepoint(Guid transactionId)
@@ -519,9 +512,6 @@ namespace XDev.Outbox.EFCore
             {
                 message.AcceptedChanges = true;
             }
-            // Changes of released, not accepted messages are accepted too, so they are no longer tracked as released. (Since
-            // every transaction end keeps unsaved events, this list no longer changes which events stay buffered.)
-            _releasedNotAcceptedEvents.Clear();
         }
 
         private void LogUnconfirmedPendingMessages(Exception exception)
@@ -719,7 +709,7 @@ namespace XDev.Outbox.EFCore
 
             if (rolledBack.Count > 0)
             {
-                ReleasePendingOutboxMessages(rolledBack, keepUnsavedEvents: true);
+                ReleasePendingOutboxMessages(rolledBack);
             }
         }
 
@@ -727,9 +717,9 @@ namespace XDev.Outbox.EFCore
         /// Forgets pending messages whose rows will never be committed, without dispatching them, and updates the
         /// buffer as described in <see cref="UpdateBuffer"/>.
         /// </summary>
-        private void ReleasePendingOutboxMessages(IReadOnlyList<SavedOutboxMessage> released, bool keepUnsavedEvents)
+        private void ReleasePendingOutboxMessages(IReadOnlyList<SavedOutboxMessage> released)
         {
-            UpdateBuffer(released, Array.Empty<SavedOutboxMessage>(), keepUnsavedEvents);
+            UpdateBuffer(released, Array.Empty<SavedOutboxMessage>());
 
             foreach (var message in released)
             {
@@ -748,23 +738,17 @@ namespace XDev.Outbox.EFCore
         /// acceptAllChangesOnSuccess = false and not accepted by a later save) the event stays buffered and is saved
         /// again with them; when they were accepted they will not be saved again, so the event is removed.
         /// Events of <paramref name="committed"/> messages are removed. Events of the other pending messages are kept
-        /// (their transaction decides). Events kept earlier for released, not accepted messages
-        /// (<c>_releasedNotAcceptedEvents</c>) are kept. Other events (never saved: no pending message, e.g. added
-        /// after the last save or before the transaction, or their save failed) are kept only when
-        /// <paramref name="keepUnsavedEvents"/> is true, which every caller passes (every end of a transaction,
-        /// commit included, keeps them).
-        /// <c>_releasedNotAcceptedEvents</c> is rebuilt from the buffer, so entries whose event the application
-        /// removed from the buffer are forgotten.
+        /// (their transaction decides). All other events are always kept (every end of a transaction, commit
+        /// included): never saved (no pending message, e.g. added after the last save or before the transaction, or
+        /// their save failed), or released earlier with their business changes still pending.
         /// </summary>
-        private void UpdateBuffer(IReadOnlyList<SavedOutboxMessage> released, IReadOnlyList<SavedOutboxMessage> committed, bool keepUnsavedEvents)
+        private void UpdateBuffer(IReadOnlyList<SavedOutboxMessage> released, IReadOnlyList<SavedOutboxMessage> committed)
         {
             var events = _outbox.Events;
             var buffered = events.ToList();
             var unmatchedReleased = released.ToList();
             var unmatchedCommitted = committed.ToList();
             var unmatchedRemaining = _pendingOutboxMessages.Except(released).Except(committed).ToList();
-            var unmatchedReleasedNotAccepted = _releasedNotAcceptedEvents.ToList();
-            var releasedNotAccepted = new List<object>();
 
             var keep = new List<object>(buffered.Count);
             foreach (var @event in buffered)
@@ -777,7 +761,6 @@ namespace XDev.Outbox.EFCore
                     if (!message.AcceptedChanges)
                     {
                         keep.Add(@event);
-                        releasedNotAccepted.Add(@event);
                     }
                     continue;
                 }
@@ -798,21 +781,10 @@ namespace XDev.Outbox.EFCore
                     continue;
                 }
 
-                index = unmatchedReleasedNotAccepted.FindIndex(x => ReferenceEquals(x, @event));
-                if (index >= 0)
-                {
-                    // Released earlier with its business changes still pending: saved again with them later.
-                    unmatchedReleasedNotAccepted.RemoveAt(index);
-                    keep.Add(@event);
-                    releasedNotAccepted.Add(@event);
-                    continue;
-                }
-
-                if (keepUnsavedEvents) keep.Add(@event);
+                // Never saved in the ended transaction, or released earlier with its business changes still pending:
+                // stays buffered and is saved later with them.
+                keep.Add(@event);
             }
-
-            _releasedNotAcceptedEvents.Clear();
-            _releasedNotAcceptedEvents.AddRange(releasedNotAccepted);
 
             if (keep.Count != buffered.Count)
             {
@@ -830,11 +802,10 @@ namespace XDev.Outbox.EFCore
         {
             if (_pendingTransactionId != null && _pendingTransactionId != Database.CurrentTransaction?.TransactionId)
             {
-                ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList(), keepUnsavedEvents: true);
+                ReleasePendingOutboxMessages(_pendingOutboxMessages.ToList());
             }
 
             var events = _outbox.Events;
-            ForgetReleasedEventsNotBuffered(events);
             if (events.Count == 0) return Array.Empty<object>();
 
             var pending = _pendingOutboxMessages.ToList();
@@ -852,28 +823,6 @@ namespace XDev.Outbox.EFCore
             return toSave;
         }
 
-        /// <summary>
-        /// Entries of <c>_releasedNotAcceptedEvents</c> whose event the application removed from the buffer (for
-        /// example with <see cref="IOutbox.ClearEvents"/> on <see cref="Outbox"/>) are forgotten, matched by reference and multiplicity, so
-        /// re-adding the same instance later does not resurrect them.
-        /// </summary>
-        private void ForgetReleasedEventsNotBuffered(IEnumerable<object> buffered)
-        {
-            if (_releasedNotAcceptedEvents.Count == 0) return;
-
-            var remaining = buffered?.ToList() ?? new List<object>();
-            var stillBuffered = new List<object>(_releasedNotAcceptedEvents.Count);
-            foreach (var @event in _releasedNotAcceptedEvents)
-            {
-                var index = remaining.FindIndex(x => ReferenceEquals(x, @event));
-                if (index < 0) continue;
-                remaining.RemoveAt(index);
-                stillBuffered.Add(@event);
-            }
-            _releasedNotAcceptedEvents.Clear();
-            _releasedNotAcceptedEvents.AddRange(stillBuffered);
-        }
-
         private int CompleteAmbientSave(OutboxSaveResult saved, bool acceptAllChangesOnSuccess)
         {
             var transactionId = Database.CurrentTransaction.TransactionId;
@@ -885,13 +834,6 @@ namespace XDev.Outbox.EFCore
                 _pendingTransactionId = transactionId;
             }
             _pendingOutboxMessages.AddRange(saved.Messages);
-
-            // Events saved again are pending again (tracked by their new message), no longer released.
-            foreach (var message in saved.Messages)
-            {
-                var index = _releasedNotAcceptedEvents.FindIndex(x => ReferenceEquals(x, message.Event));
-                if (index >= 0) _releasedNotAcceptedEvents.RemoveAt(index);
-            }
 
             if (acceptAllChangesOnSuccess)
             {
@@ -923,9 +865,6 @@ namespace XDev.Outbox.EFCore
                 var index = events.FindIndex(x => ReferenceEquals(x, message.Event));
                 if (index >= 0) events.RemoveAt(index);
             }
-            // Every event the save collected, including released ones, was persisted and committed by this save; an
-            // event added during the save was never saved or released.
-            _releasedNotAcceptedEvents.Clear();
 
             if (acceptAllChangesOnSuccess)
             {

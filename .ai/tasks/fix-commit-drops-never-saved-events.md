@@ -89,5 +89,5 @@ that abandons its unit of work must call `Outbox.ClearEvents()`.
 ## Open follow-ups
 
 - Owned save drops events added during the save (needs a decision).
-- Cleanup: `_releasedNotAcceptedEvents` / `keepUnsavedEvents` no longer
-  affect outcomes.
+- Cleanup of `_releasedNotAcceptedEvents` / `keepUnsavedEvents`: done
+  (`tasks/cleanup-released-not-accepted-events.md`).

@@ -157,4 +157,5 @@ reference/multiplicity), keeping events added during the save.
 - Nested `SaveChanges` from a save handler (duplicate row or failed save).
 - `AcceptAllChanges` throwing after an owned commit (committed event written
   again by the next save); fix by updating the buffer before/finally.
-- Cleanup: `_releasedNotAcceptedEvents` / `keepUnsavedEvents`.
+- Cleanup of `_releasedNotAcceptedEvents` / `keepUnsavedEvents`: done
+  (`tasks/cleanup-released-not-accepted-events.md`).

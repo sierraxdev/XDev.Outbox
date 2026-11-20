@@ -262,9 +262,9 @@ constructor throws naming the registration methods.
   accepted message is released (B1), through `Outbox.ClearEvents()`, or when
   the context or pool lease ends. (Before, a commit dropped them, and an
   explicit rollback did too, so a later save committed the business change
-  without its outbox row.) `_releasedNotAcceptedEvents` and the
-  `keepUnsavedEvents` parameter no longer affect outcomes (cleanup
-  candidate). Pinned by `NeverSavedEventsOnCommitTests`,
+  without its outbox row.) The former `_releasedNotAcceptedEvents` list and
+  `keepUnsavedEvents` parameter were removed as dead code on 2026-11-20.
+  Pinned by `NeverSavedEventsOnCommitTests`,
   `NeverSavedEventsOnTransactionEndTests`, `TesterRollbackKeepTests`,
   `TesterNeverSavedOnCommitTests`. Consumer consequences:
   - an app that abandons its unit of work (`ChangeTracker.Clear()`,
