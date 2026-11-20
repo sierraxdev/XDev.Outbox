@@ -199,6 +199,11 @@ public sealed class RecordingStore : IOutboxStore<int>
         lock (Updated) Updated.Add(message);
         return Task.CompletedTask;
     }
+
+    // Not used by these tests (their queue is not the built-in one, so nothing is renewed). A store that cannot renew
+    // throws: an empty result would mean "every lock was lost" and drop queued messages.
+    public Task<IReadOnlyDictionary<int, DateTime>> RenewLocksAsync(IReadOnlyDictionary<int, DateTime> expectedLocks, DateTime lockExpiration, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("RecordingStore does not renew locks.");
 }
 
 /// <summary>Captures the hosted service's MessageReceived handler so a test can deliver a message to it directly.</summary>

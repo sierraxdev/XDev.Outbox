@@ -287,6 +287,32 @@ public abstract class TableNameScenarioTests<TContext> where TContext : SmokeCon
         Assert.Equal(all.Count, all.Distinct().Count());
         Assert.Subset(ids, all.ToHashSet());
     }
+
+    [SqlServerFact]
+    public async Task RenewLocksAsync_ClaimedRows_RenewsOnlyTheMatchingRowsOfTheMappedTable()
+    {
+        using var host = CreateHost();
+        var ids = Enumerable.Range(0, 3).Select(_ => StoreSeed.Row(host.Database, host.OutboxTable, null, null)).ToList();
+
+        await using var scope = host.CreateScope();
+        var claimed = (await Store(scope).GetAllAsync(10, DateTime.UtcNow.AddMinutes(5), 15)).ToList();
+        var expected = claimed.Where(m => m.Id != ids[1]).ToDictionary(m => m.Id, m => m.LockExpiresAt!.Value);
+        expected[ids[1]] = claimed.Single(m => m.Id == ids[1]).LockExpiresAt!.Value.AddSeconds(1); // stale expectation
+        var newLock = DateTime.UtcNow.AddMinutes(20).AddTicks(1234);
+        host.Faults.ClearLog();
+
+        var renewed = await Store(scope).RenewLocksAsync(expected, newLock);
+
+        var command = Assert.Single(host.Faults.Commands);
+        _output.WriteLine(command.ToString());
+        Assert.Contains(host.OutboxTable, command.Sql);
+        Assert.Equal(new[] { ids[0], ids[2] }, renewed.Keys.OrderBy(x => x));
+        var rows = host.OutboxRows().ToDictionary(r => int.Parse(r.Id));
+        Assert.Equal(newLock, rows[ids[0]].LockExpiresAt);
+        Assert.Equal(newLock, rows[ids[2]].LockExpiresAt);
+        Assert.Equal(renewed[ids[0]], rows[ids[0]].LockExpiresAt);
+        Assert.Equal(claimed.Single(m => m.Id == ids[1]).LockExpiresAt, rows[ids[1]].LockExpiresAt);
+    }
 }
 
 public class DefaultAndTableSchemaScenarioTests : TableNameScenarioTests<DefaultAndTableSchemaDbContext>, IClassFixture<SmokeDatabaseFixture>

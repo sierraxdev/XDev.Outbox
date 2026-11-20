@@ -74,7 +74,24 @@ No indexes beyond the PK are defined.
 - **Delete**: `RemoveAsync` on successful dispatch, via `SaveChangesAsync` on
   the handler scope's `TContext`.
 - **Failure update**: `UpdateAsync` uses `DbSet.Update` on a detached entity
-  and rewrites all columns, including the re-serialized payload.
+  and rewrites all columns, including the re-serialized payload, except
+  `LockExpiresAt` (since 2026-11-20; before, a handler that had lost its lock
+  wrote its old, expired lock back and made the row claimable again).
+- **Lock renewal**: `RenewLocksAsync` (required `IOutboxStore` member since
+  2026-11-20). Per chunk of at most 1000 ids:
+  `UPDATE t SET LockExpiresAt = @lockExpiration OUTPUT INSERTED.Id,
+  INSERTED.LockExpiresAt FROM <table> AS t WITH (ROWLOCK) INNER JOIN (VALUES
+  (@id, @expected), ...) AS v ON t.Id = v.Id AND t.LockExpiresAt BETWEEN
+  expected ± 5 ms`. Lock values are sent as `datetime2`; ids as int, bigint or
+  uniqueidentifier. No `READPAST`: a renewal racing a claim waits, and exactly
+  one wins (tested, also with READ_COMMITTED_SNAPSHOT on). It never inserts,
+  so deleted rows are not recreated. Chunks are separate autocommit
+  statements (not atomic across chunks; the hosted service compensates).
+  Like the claim, it fails on tables with triggers (`OUTPUT` without `INTO`,
+  SQL error 334). `LockExpiresAt` needs millisecond precision or better
+  (`datetime`, or `datetime2(3)` or finer).
+- Only the claim and renewal statements (and the insert) write
+  `LockExpiresAt`, and only forward in time.
 
 ## Transactions and Isolation
 
@@ -128,6 +145,7 @@ No indexes beyond the PK are defined.
 
 ## Idempotency and Duplicates
 
-There is no deduplication key. Duplicate dispatch prevention relies only on
-`LockExpiresAt`. Delivery is at-least-once (see
-`business-rules/message-delivery.md`).
+There is no deduplication key. Duplicate dispatch prevention relies on
+`LockExpiresAt` (claim, renewal) plus in-process dedup in the built-in
+`MemoryMessageQueue` (see `components/outbox-dispatch-runtime.md`). Delivery
+is at-least-once (see `business-rules/message-delivery.md`).

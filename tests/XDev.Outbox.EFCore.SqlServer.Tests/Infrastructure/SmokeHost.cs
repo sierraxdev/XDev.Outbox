@@ -6,7 +6,7 @@ using Microsoft.Extensions.DependencyInjection;
 namespace XDev.Outbox.EFCore.SqlServer.Tests.Infrastructure;
 
 /// <summary>An enqueued message; <see cref="RowStateAtEnqueue"/> is "committed", "absent" or "locked" (uncommitted).</summary>
-public sealed record EnqueuedMessage<TKey>(TKey Id, object? Payload, string? Type, string? RowStateAtEnqueue) where TKey : struct;
+public sealed record EnqueuedMessage<TKey>(TKey Id, object? Payload, string? Type, string? RowStateAtEnqueue, DateTime? LockExpiresAt = null) where TKey : struct;
 
 /// <summary>Records every enqueue and never dispatches. Registered before AddOutbox so its TryAdd keeps it.</summary>
 public sealed class RecordingMessageQueue<TKey> : IMessageQueue<TKey> where TKey : struct
@@ -25,7 +25,7 @@ public sealed class RecordingMessageQueue<TKey> : IMessageQueue<TKey> where TKey
     public Task EnqueueAsync(OutboxMessage<TKey> message, CancellationToken cancellationToken = default)
     {
         var state = RowProbe?.Invoke(message.Id);
-        lock (_gate) _items.Add(new EnqueuedMessage<TKey>(message.Id, message.Payload, message.Type, state));
+        lock (_gate) _items.Add(new EnqueuedMessage<TKey>(message.Id, message.Payload, message.Type, state, message.LockExpiresAt));
         return Task.CompletedTask;
     }
 

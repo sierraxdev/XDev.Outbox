@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit.Abstractions;
@@ -217,6 +217,39 @@ public class OutboxStoreTests : IClassFixture<SmokeDatabaseFixture>
         _output.WriteLine("Seeded:   " + payload);
         _output.WriteLine("Rewritten: " + row.Payload);
         Assert.True(GraphAssert.JsonEquals(payload, row.Payload), "UpdateAsync changed the payload.");
+    }
+
+    /// <summary>
+    /// A handler that outlived its lock fails after another claimer re-locked the row: the failure update must not
+    /// move the lock back to the stale value it read (that would let a third claimer take the row at once).
+    /// </summary>
+    [SqlServerFact]
+    public async Task UpdateAsync_StaleMessageAfterTheRowWasReclaimed_KeepsTheCurrentLockAndRecordsTheFailure()
+    {
+        using var host = CreateHost();
+        var id = StoreSeed.Row(host, null, 2);
+
+        await using var scope = host.CreateScope();
+        var store = Store(scope);
+        var stale = (await store.GetAllAsync(1, DateTime.UtcNow.AddMinutes(-1), 15)).Single();
+        var reclaimedLock = new DateTime(2099, 5, 6, 7, 8, 9).AddTicks(1234567);
+        host.Database.Execute($"UPDATE {host.OutboxTable} SET [LockExpiresAt] = @lock WHERE [Id] = @id",
+            ("@lock", reclaimedLock), ("@id", id));
+        var storedReclaimedLock = Assert.Single(host.OutboxRows()).LockExpiresAt;
+
+        stale.Attemps = (stale.Attemps ?? 0) + 1;
+        stale.IsError = true;
+        stale.ErrorMessage = "stale handler failed";
+        await store.UpdateAsync(stale);
+
+        var row = Assert.Single(host.OutboxRows());
+        Assert.Equal(storedReclaimedLock, row.LockExpiresAt);
+        Assert.Equal(3, row.Attemps);
+        Assert.True(row.IsError);
+        Assert.Equal("stale handler failed", row.ErrorMessage);
+        var update = Assert.Single(host.Faults.Commands, c => c.Sql.Contains("UPDATE [OutboxMessages] SET", StringComparison.OrdinalIgnoreCase));
+        _output.WriteLine(update.ToString());
+        Assert.DoesNotContain("[LockExpiresAt]", update.Sql);
     }
 }
 

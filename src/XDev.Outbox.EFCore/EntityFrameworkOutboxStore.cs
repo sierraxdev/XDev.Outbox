@@ -126,10 +126,98 @@ namespace XDev.Outbox.EFCore
             return _dbContext.SaveChangesAsync(cancellationToken);
         }
 
+        /// <summary>
+        /// Records a failed attempt. Every column except <c>LockExpiresAt</c> is written: the lock is owned by the
+        /// claim and renewal statements, so a handler that outlived its lock never moves another claimer's lock back.
+        /// </summary>
         public Task UpdateAsync(OutboxMessage<TKey> message, CancellationToken cancellationToken = default)
         {
-            _dbContext.OutboxMessages.Update(message);
+            var entry = _dbContext.OutboxMessages.Update(message);
+            entry.Property(m => m.LockExpiresAt).IsModified = false;
             return _dbContext.SaveChangesAsync(cancellationToken);
+        }
+
+        /// <summary>Ids per renewal statement: two parameters each, under SQL Server's 2100-parameter limit.</summary>
+        private const int RenewalChunkSize = 1000;
+
+        /// <inheritdoc />
+        /// <remarks>
+        /// One conditional <c>UPDATE ... OUTPUT</c> per chunk of at most 1000 Ids. It takes row locks and waits for rows
+        /// another statement holds (no <c>READPAST</c>), then re-checks the expected value, so a renewal racing a claim
+        /// never both succeed. Times are sent as <c>datetime2</c> so exact stored values (immediate dispatch) match.
+        /// </remarks>
+        public async Task<IReadOnlyDictionary<TKey, DateTime>> RenewLocksAsync(IReadOnlyDictionary<TKey, DateTime> expectedLocks, DateTime lockExpiration, CancellationToken cancellationToken = default)
+        {
+            if (expectedLocks == null) throw new ArgumentNullException(nameof(expectedLocks));
+
+            var renewed = new Dictionary<TKey, DateTime>();
+            if (expectedLocks.Count == 0) return renewed;
+
+            // Formatted with the parameter placeholders like the claim, so braces in the table name are escaped.
+            var table = OutboxSqlText.EscapeFormat(
+                OutboxSqlText.DelimitedTableName(_dbContext, _dbContext.Model.FindEntityType(typeof(OutboxMessage<TKey>))));
+
+            foreach (var chunk in expectedLocks.Select((pair, index) => (pair, index)).GroupBy(x => x.index / RenewalChunkSize, x => x.pair))
+            {
+                var @params = new List<SqlParameter>
+                {
+                    new SqlParameter("@lockExpiration", System.Data.SqlDbType.DateTime2) { Value = lockExpiration },
+                };
+                var values = new StringBuilder();
+                var i = 0;
+                foreach (var pair in chunk)
+                {
+                    if (i > 0) values.Append(", ");
+                    values.Append("(@id").Append(i).Append(", @e").Append(i).Append(')');
+                    @params.Add(KeyParameter("@id" + i, pair.Key));
+                    @params.Add(new SqlParameter("@e" + i, System.Data.SqlDbType.DateTime2) { Value = pair.Value });
+                    i++;
+                }
+
+                var sql = $"""
+                    UPDATE t
+                    SET LockExpiresAt = @lockExpiration
+                    OUTPUT INSERTED.Id AS Id, INSERTED.LockExpiresAt AS LockExpiresAt
+                    FROM {table} AS t WITH (ROWLOCK)
+                    INNER JOIN (VALUES {values}) AS v(Id, Expected)
+                        ON t.Id = v.Id
+                        AND t.LockExpiresAt BETWEEN DATEADD(millisecond, -5, v.Expected) AND DATEADD(millisecond, 5, v.Expected);
+                    """;
+
+                var rows = await _dbContext.Database
+                    .SqlQueryRaw<RenewedLock>(sql, @params.ToArray())
+                    .ToListAsync(cancellationToken);
+                foreach (var row in rows)
+                {
+                    renewed[row.Id] = row.LockExpiresAt;
+                }
+            }
+
+            return renewed;
+        }
+
+        private static SqlParameter KeyParameter(string name, TKey value)
+        {
+            object boxed = value;
+            switch (boxed)
+            {
+                case int _:
+                    return new SqlParameter(name, System.Data.SqlDbType.Int) { Value = boxed };
+                case long _:
+                    return new SqlParameter(name, System.Data.SqlDbType.BigInt) { Value = boxed };
+                case Guid _:
+                    return new SqlParameter(name, System.Data.SqlDbType.UniqueIdentifier) { Value = boxed };
+                default:
+                    // Other key types: SqlClient infers the type from the value.
+                    return new SqlParameter(name, boxed);
+            }
+        }
+
+        /// <summary>A row returned by the renewal statement's OUTPUT clause.</summary>
+        internal sealed class RenewedLock
+        {
+            public TKey Id { get; set; }
+            public DateTime LockExpiresAt { get; set; }
         }
 
         /// <summary>Disposes the context when the store created it from the factory; a scope's context is left to the scope.</summary>

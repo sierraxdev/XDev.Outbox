@@ -2,18 +2,62 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace XDev.Outbox
 {
-    public class MemoryMessageQueue<TKey> : IMessageQueue<TKey> where TKey : struct
+    /// <summary>
+    /// In-process queue that hands messages to the <see cref="MessageReceived"/> handler, at most 10 at a time. A message
+    /// whose Id is already queued or being handled is not added again; it can be enqueued again once its handler has
+    /// returned.
+    /// </summary>
+    /// <remarks>
+    /// Only with this queue does <see cref="OutboxProcessorHostedService{TKey}"/> renew the row locks of queued and
+    /// in-flight messages (<see cref="IOutboxStore{TKey}.RenewLocksAsync"/>) and pace the poller (after a full batch it
+    /// waits until that batch is handled, for at most the lock span). With a custom <see cref="IMessageQueue{TKey}"/>
+    /// neither happens. Renewal runs every third of the lock span but never more often than every 100 ms, so a span below
+    /// about 300 ms cannot be kept alive. The renewal match also needs a <c>LockExpiresAt</c> column with at least
+    /// millisecond precision (SQL Server <c>datetime</c>, or <c>datetime2(3)</c> or finer).
+    /// </remarks>
+    public class MemoryMessageQueue<TKey> : IMessageQueue<TKey>, IMessageLockTracker<TKey> where TKey : struct
     {
         private readonly ILogger _logger;
         private const int WARNING_MAX_ITEMS = 300;
         private const int MaxConcurrentCalls = 10;
 
-        private ConcurrentQueue<OutboxMessage<TKey>> _messages = new ConcurrentQueue<OutboxMessage<TKey>>();
+        /// <summary>
+        /// One queued or in-flight message. Its fields are read and written under a lock on the entry. Once
+        /// <see cref="Removed"/> is set the entry is no longer in <see cref="_tracked"/>.
+        /// </summary>
+        private sealed class Entry
+        {
+            public Entry(OutboxMessage<TKey> message)
+            {
+                Message = message;
+                ExpectedLock = message.LockExpiresAt;
+            }
+
+            public OutboxMessage<TKey> Message { get; }
+
+            /// <summary>The lock this process expects on the row; a copy, the message itself is never changed.</summary>
+            public DateTime? ExpectedLock;
+
+            /// <summary>The handler was invoked (in flight).</summary>
+            public bool Started;
+
+            /// <summary>Stopwatch timestamp when the handler was invoked.</summary>
+            public long StartedAt;
+
+            /// <summary>The row lock could not be renewed: a queued copy is skipped, a running handler continues.</summary>
+            public bool Revoked;
+
+            public bool Removed;
+        }
+
+        private readonly ConcurrentDictionary<TKey, Entry> _tracked = new ConcurrentDictionary<TKey, Entry>();
+        private ConcurrentQueue<Entry> _messages = new ConcurrentQueue<Entry>();
         private SemaphoreSlim _messageSignalSemaphore = new SemaphoreSlim(0);
         private SemaphoreSlim _subscriberSemaphore = new SemaphoreSlim(0);
 
@@ -47,14 +91,92 @@ namespace XDev.Outbox
                 throw new ArgumentNullException(nameof(message));
             }
 
-            if (_messages.Count >= WARNING_MAX_ITEMS)
+            while (true)
             {
-                _logger.LogWarning($"Message queue reached {WARNING_MAX_ITEMS} items. Consider processing items in parallel or upgrade to a service bus or similar queue.");
-            }
+                var entry = new Entry(message);
+                var existing = _tracked.GetOrAdd(message.Id, entry);
+                if (ReferenceEquals(existing, entry))
+                {
+                    if (_messages.Count >= WARNING_MAX_ITEMS)
+                    {
+                        _logger.LogWarning($"Message queue reached {WARNING_MAX_ITEMS} items. Consider processing items in parallel or upgrade to a service bus or similar queue.");
+                    }
 
-            _messages.Enqueue(message);
-            _messageSignalSemaphore.Release();
-            return Task.CompletedTask;
+                    _messages.Enqueue(entry);
+                    _messageSignalSemaphore.Release();
+                    return Task.CompletedTask;
+                }
+
+                lock (existing)
+                {
+                    // Removed between GetOrAdd and the lock: the handler has finished, so this copy is added as new.
+                    if (existing.Removed) continue;
+
+                    // A newer lock means this process claimed the row again: that is the lock to renew, and a message
+                    // whose lock had been lost is owned again.
+                    if (message.LockExpiresAt.HasValue && (!existing.ExpectedLock.HasValue || message.LockExpiresAt.Value > existing.ExpectedLock.Value))
+                    {
+                        existing.ExpectedLock = message.LockExpiresAt;
+                        existing.Revoked = false;
+                    }
+
+                    _logger.LogDebug("Message {Id} is already {State}; the duplicate is not enqueued.", message.Id, existing.Started ? "being handled" : "queued");
+                }
+                return Task.CompletedTask;
+            }
+        }
+
+        IReadOnlyList<TrackedMessageLock<TKey>> IMessageLockTracker<TKey>.GetTrackedLocks()
+        {
+            var result = new List<TrackedMessageLock<TKey>>();
+            var now = Stopwatch.GetTimestamp();
+            foreach (var pair in _tracked)
+            {
+                var entry = pair.Value;
+                lock (entry)
+                {
+                    if (entry.Removed || entry.Revoked || !entry.ExpectedLock.HasValue) continue;
+                    TimeSpan? inFlightFor = null;
+                    if (entry.Started)
+                    {
+                        inFlightFor = TimeSpan.FromSeconds((now - entry.StartedAt) / (double)Stopwatch.Frequency);
+                    }
+                    result.Add(new TrackedMessageLock<TKey>(pair.Key, entry.ExpectedLock.Value, inFlightFor));
+                }
+            }
+            return result;
+        }
+
+        bool IMessageLockTracker<TKey>.IsTracked(TKey id) => _tracked.ContainsKey(id);
+
+        bool IMessageLockTracker<TKey>.ConfirmRenewal(TKey id, DateTime expectedSent, DateTime newStored)
+        {
+            if (!_tracked.TryGetValue(id, out var entry)) return false;
+            lock (entry)
+            {
+                if (entry.Removed || entry.Revoked || entry.ExpectedLock != expectedSent) return false;
+                entry.ExpectedLock = newStored;
+                return true;
+            }
+        }
+
+        LockRevocation IMessageLockTracker<TKey>.Revoke(TKey id, DateTime expectedSent)
+        {
+            if (!_tracked.TryGetValue(id, out var entry)) return LockRevocation.NotApplied;
+            lock (entry)
+            {
+                if (entry.Removed || entry.Revoked || entry.ExpectedLock != expectedSent) return LockRevocation.NotApplied;
+                entry.Revoked = true;
+                return entry.Started ? LockRevocation.InFlight : LockRevocation.QueuedDropped;
+            }
+        }
+
+        /// <summary>Removes <paramref name="entry"/> from tracking. Call under the entry's lock.</summary>
+        private void Untrack(Entry entry)
+        {
+            entry.Removed = true;
+            // Removes the key only while it still maps to this entry.
+            ((ICollection<KeyValuePair<TKey, Entry>>)_tracked).Remove(new KeyValuePair<TKey, Entry>(entry.Message.Id, entry));
         }
 
         public async Task StartAsync(CancellationToken cancellationToken = default)
@@ -162,10 +284,32 @@ namespace XDev.Outbox
         {
             try
             {
-                if (_messages.TryDequeue(out var message))
+                if (_messages.TryDequeue(out var entry))
                 {
-                    _logger.LogInformation($"Handling message with id {message.Id}");
-                    await _messageReceived(message, cancellationToken);
+                    lock (entry)
+                    {
+                        if (entry.Revoked)
+                        {
+                            Untrack(entry);
+                            _logger.LogDebug("Message {Id} lost its lock while queued; it is not handled here.", entry.Message.Id);
+                            return;
+                        }
+                        entry.Started = true;
+                        entry.StartedAt = Stopwatch.GetTimestamp();
+                    }
+
+                    try
+                    {
+                        _logger.LogInformation($"Handling message with id {entry.Message.Id}");
+                        await _messageReceived(entry.Message, cancellationToken);
+                    }
+                    finally
+                    {
+                        lock (entry)
+                        {
+                            Untrack(entry);
+                        }
+                    }
                 }
             }
             catch (Exception ex)

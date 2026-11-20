@@ -93,9 +93,16 @@ method resolves the type, converts the payload, calls
    `Attemps` is below the maximum. The claim sets
    `LockExpiresAt = now + MessageLockExpirationTimeSpan`.
 2. It enqueues each claimed row.
-3. If 100 or fewer rows came back, it waits 30 minutes. Otherwise it loops
+3. If 100 or fewer rows came back, it waits 30 minutes. Otherwise, with the
+   built-in `MemoryMessageQueue`, it waits (checking every second) until none
+   of that batch is still queued or being handled, at most one lock span, then
+   claims again (backpressure, since 2026-11-20). With other queues it loops
    immediately.
 4. On a store error, it logs and waits 5 minutes.
+
+Beside the poll loop, a lock-renewal loop (built-in queue only) renews the
+locks of messages queued or being handled in this process every
+span/3 (see `components/outbox-dispatch-runtime.md`).
 
 Shutdown: cancellation usually arrives during the 30-minute `Task.Delay`. The
 `OperationCanceledException` is caught by the generic `catch`, which logs
@@ -147,8 +154,10 @@ unknown unless stated.
 
 - Automated tests cover the EF Core save and dispatch path
   (`tests/XDev.Outbox.EFCore.Tests`, SQLite) and subscriber registration
-  (`tests/XDev.Outbox.Tests`). The queue, the SQL Server claim query, and the
-  hosted service have no tests.
+  (`tests/XDev.Outbox.Tests`). Since 2026-11-20 `tests/XDev.Outbox.Tests` also
+  covers the queue (dedup), the hosted service (renewal, backpressure,
+  `HandleMessageAsync`), and the SQL Server suite covers the claim, renewal
+  and the hosted service end to end.
 - The save path is a large state machine (about 1,100 lines) that depends on
   undocumented EF change-tracker internals, plus `ContextId.Lease` for the
   per-lease reset of pooled contexts. See

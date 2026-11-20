@@ -124,9 +124,9 @@ Run all four target frameworks; EF behavior differs by version.
 - On 2026-11-19 the EFCore suite reported 1075 tests on net8.0 and 1074 on
   net9.0–net11.0, all passed, none skipped.
 - Also run `dotnet test tests/XDev.Outbox.Tests -f <tfm>` for the same four
-  frameworks. On 2026-11-19 each reported 26 passed.
-- Core runtime coverage is limited to subscriber registration and
-  `EventPublisher`. The queue and hosted service have no tests, and the
+  frameworks. On 2026-11-20 each reported 67 passed.
+- Core runtime coverage: subscriber registration, `EventPublisher`, the
+  queue (dedup) and the hosted service (renewal, backpressure). The
   netstandard code paths are compiled but not executed by tests.
 
 ### Integration Tests
@@ -139,7 +139,7 @@ SQL Server smoke suite (net8–net11). Defaults to LocalDB
 `(localdb)\MSSQLLocalDB`; `XDEV_OUTBOX_SQLSERVER` overrides the base
 connection string. Tests skip when the server is unreachable. Each class
 creates and drops a `XDevOutboxSmoke_<guid>` database. On 2026-11-19 each
-TFM reported 342 tests, all passed, none skipped (2026-11-20).
+TFM reported 377 tests, all passed, none skipped (2026-11-20).
 
 The sample can also be run manually: `samples/Example`
 (`dotnet run --project samples/Example -- --console`) against SQL Server

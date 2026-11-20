@@ -136,16 +136,19 @@ Each rule is labeled:
 - [Confirmed] Delivery is **at-least-once**. Duplicates are possible in these
   cases:
   - the handler succeeds but the row delete fails;
-  - processing outlasts `MessageLockExpirationTimeSpan` and the poller
-    re-claims the row;
+  - with the built-in `MemoryMessageQueue` (since 2026-11-20), a row whose
+    message is queued or being handled is not re-claimed while its lock is
+    renewed, and the same Id is never dispatched twice at once in one
+    process. Lock expiry can still cause a duplicate when renewal fails for
+    longer than the remaining lock (database outage, process pause), when a
+    handler outlives its lock during shutdown, or when a caller transaction
+    commits after its row's insert-time lock expired;
+  - with a custom `IMessageQueue` there is no renewal or dedup: processing
+    that outlasts `MessageLockExpirationTimeSpan` and backlog re-claim (rows
+    still queued when their lock expires) can dispatch again;
   - the process crashes after the handler and before the delete;
   - with several subscribers, those that succeeded run again when a later one
-    fails;
-  - **backlog re-claim**: while more than 100 rows are claimable, the poller
-    loops with no delay, claiming 101 rows per pass into the unbounded
-    in-memory queue. That queue handles 10 messages at a time. Rows still
-    queued when their 5-minute lock expires are claimed and enqueued again in
-    the same process.
+    fails.
 
   Subscribers should be idempotent.
 - [Confirmed] There is no ordering guarantee. The claim query orders by `Id`,
@@ -156,14 +159,17 @@ Each rule is labeled:
   `ErrorMessage = exception.Message`. Since 2026-11-19 this is the
   subscriber's own exception even when it throws synchronously (before, it
   was the reflection wrapper text "Exception has been thrown by the target of
-  an invocation."). `LockExpiresAt` is not changed, so the
-  retry happens on a later poll after the lock expires.
+  an invocation."). `LockExpiresAt` is not written by the failure update
+  (since 2026-11-20 it is excluded explicitly), so the retry happens on a
+  later poll after the last claimed or renewed lock expires (at most one span
+  after the failure, since renewal stops when the handler finishes).
 - [Confirmed] Retry stops when `Attemps >= MaxAttemps`. `MaxAttemps` defaults
   to 15 when `OutboxConfiguration.MaxAttemps` is null. Rows past the limit stay
   in the table permanently. There is no dead-letter handling or cleanup.
 - [Confirmed] Retry timing has no backoff. A failed message is retried at the
-  first poll after its lock expires. Polls happen every 30 minutes, or
-  continuously while the backlog exceeds 100 rows, so the retry delay can reach
+  first poll after its lock expires. Polls happen every 30 minutes, or, while
+  the backlog exceeds 100 rows, as soon as the previous batch is handled
+  (built-in queue; at most one lock span later), so the retry delay can reach
   about 30 minutes.
 
 ## Payload Received by Subscribers
