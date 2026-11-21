@@ -63,7 +63,7 @@ public class OwnedSaveEventsAddedDuringSaveTests : IClassFixture<SmokeDatabaseFi
         Assert.Equal(2, orders.Count);
         Assert.All(orders, o => Assert.Equal(dbUser.Id, o.UserId));
         var first = Assert.Single(host.OutboxRows());
-        Assert.Equal(typeof(UserCreated).AssemblyQualifiedName, first.Type);
+        Assert.Equal(StoredTypeName.Of<UserCreated>(), first.Type);
         GraphAssert.UserPayloadMatches(first.Payload, users, orders);
         Assert.Equal(2, raised());
         var kept = db.Outbox.GetEvents().ToList();
@@ -76,9 +76,9 @@ public class OwnedSaveEventsAddedDuringSaveTests : IClassFixture<SmokeDatabaseFi
         Assert.Equal(2, raised());
         var rows = host.OutboxRows();
         Assert.Equal(3, rows.Count);
-        Assert.Equal(2, rows.Count(r => r.Type == typeof(OrderPlaced).AssemblyQualifiedName));
+        Assert.Equal(2, rows.Count(r => r.Type == StoredTypeName.Of<OrderPlaced>()));
         GraphAssert.RowsMatch(rows, users, orders);
-        var orderIdsInPayloads = rows.Where(r => r.Type == typeof(OrderPlaced).AssemblyQualifiedName)
+        var orderIdsInPayloads = rows.Where(r => r.Type == StoredTypeName.Of<OrderPlaced>())
             .Select(r => Json.Parse(r.Payload!).GetProperty("order").GetProperty("id").GetInt32()).OrderBy(x => x);
         Assert.Equal(orders.Select(o => o.Id).OrderBy(x => x), orderIdsInPayloads);
 

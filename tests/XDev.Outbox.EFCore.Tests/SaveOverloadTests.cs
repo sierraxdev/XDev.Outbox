@@ -43,7 +43,7 @@ public class SaveOverloadTests
 
         var rows = host.OutboxRows();
         Assert.Single(rows);
-        Assert.Equal(typeof(UserCreated).AssemblyQualifiedName, rows[0].Type);
+        Assert.Equal(OutboxTypeName.Get(typeof(UserCreated)), rows[0].Type);
 
         var enqueued = Assert.Single(host.Queue.Enqueued);
         Assert.NotEqual(0, enqueued.Id);

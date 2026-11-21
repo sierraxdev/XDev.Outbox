@@ -18,13 +18,15 @@ registers. Without it, the `OutboxMessageConfiguration` constructor throws a
 
 Table name defaults to `OutboxMessages` (`OutboxDbContextConfiguration.TableName`,
 set via `AddEFCoreOutboxStore(o => o.TableName = ...)`). Columns come from
-`OutboxMessage<TKey>`. The names are part of the public contract, including
-the misspelling `Attemps`.
+`OutboxMessage<TKey>`. The default names are part of the public contract,
+including the misspelling `Attemps`. Consumers may rename columns
+(`HasColumnName` after `base.OnModelCreating`, or a naming convention): since
+2026-11-20 the claim and renewal SQL read the column names from the model.
 
 | Column | Type (sample, int key) | Notes |
 |---|---|---|
 | `Id` | `int` identity, or `uniqueidentifier` for `Guid` | PK. Only `int` and `Guid` keys are accepted by `AddOutbox`. |
-| `Type` | `nvarchar(200) NULL` | Assembly-qualified CLR type name of the event. |
+| `Type` | `nvarchar(200) NULL` | CLR type name of the event: since 2026-11-20 the assembly-qualified name without Version/Culture/PublicKeyToken at every level (older rows: full assembly-qualified name; both resolve). |
 | `Payload` | `nvarchar(max) NULL` | JSON via value converter. Read back as `ExpandoObject`. |
 | `Created` | `datetime2` | UTC creation time. |
 | `LockExpiresAt` | `datetime2 NULL` | Claim/lock expiry (UTC). |
@@ -62,10 +64,11 @@ No indexes beyond the PK are defined.
   ```sql
   ;WITH cte AS (
       SELECT TOP (@take) * FROM [<schema>].[<table>] WITH (ROWLOCK, READPAST, UPDLOCK)
-      WHERE (Attemps IS NULL OR Attemps < @maxAttemps)
-        AND (LockExpiresAt IS NULL OR LockExpiresAt < @dateTimeNow)
-      ORDER BY Id)  -- TOP and ORDER BY only when itemsCount has a value
-  UPDATE cte SET LockExpiresAt = @lockExpiration OUTPUT INSERTED.*;
+      WHERE ([Attemps] IS NULL OR [Attemps] < @maxAttemps)
+        AND ([LockExpiresAt] IS NULL OR [LockExpiresAt] < @dateTimeNow)
+      ORDER BY [Id])  -- TOP and ORDER BY only when itemsCount has a value
+  UPDATE cte SET [LockExpiresAt] = @lockExpiration OUTPUT INSERTED.*;
+  -- column names come from the model (delimited, braces escaped)
   ```
 
   The statement is parameterized. The table name comes from the EF model, not
@@ -79,10 +82,11 @@ No indexes beyond the PK are defined.
   wrote its old, expired lock back and made the row claimable again).
 - **Lock renewal**: `RenewLocksAsync` (required `IOutboxStore` member since
   2026-11-20). Per chunk of at most 1000 ids:
-  `UPDATE t SET LockExpiresAt = @lockExpiration OUTPUT INSERTED.Id,
-  INSERTED.LockExpiresAt FROM <table> AS t WITH (ROWLOCK) INNER JOIN (VALUES
-  (@id, @expected), ...) AS v ON t.Id = v.Id AND t.LockExpiresAt BETWEEN
-  expected ± 5 ms`. Lock values are sent as `datetime2`; ids as int, bigint or
+  `UPDATE t SET <lock> = @lockExpiration OUTPUT INSERTED.<id> AS [Id],
+  INSERTED.<lock> AS [LockExpiresAt] FROM <table> AS t WITH (ROWLOCK) INNER
+  JOIN (VALUES (@id, @expected), ...) AS v(Id, Expected) ON t.<id> = v.Id AND
+  t.<lock> BETWEEN expected ± 5 ms`, where `<id>`/`<lock>` are the model's
+  delimited column names. Lock values are sent as `datetime2`; ids as int, bigint or
   uniqueidentifier. No `READPAST`: a renewal racing a claim waits, and exactly
   one wins (tested, also with READ_COMMITTED_SNAPSHOT on). It never inserts,
   so deleted rows are not recreated. Chunks are separate autocommit
@@ -128,9 +132,18 @@ No indexes beyond the PK are defined.
   (falling back to model default, then `dbo`), undelimited. The library no
   longer uses it; it can disagree with the claim when no schema is set and
   the login's default schema is not `dbo`.
-- **Known limitation.** The claim SQL hard-codes undelimited column names
-  (`Id`, `Attemps`, `LockExpiresAt`); renaming them (`HasColumnName`, naming
-  conventions) breaks the claim while saves keep working.
+- **Column names (fixed 2026-11-20).** The claim and renewal SQL resolve
+  `Id`, `Attemps` and `LockExpiresAt` with
+  `GetColumnName(StoreObjectIdentifier.Table(...))`, delimit them and escape
+  braces (`OutboxSqlText.DelimitedColumnName`); `HasColumnName` and naming
+  conventions (incl. convention-set plugins) work. The renewal result type
+  `RenewedLock` pins its columns with `[Column]`, because convention plugins
+  also rename `SqlQuery` result types. Unsupported: table-specific column
+  overrides (`ToTable(t => t.Property(..).HasColumnName(..))`): the claim
+  throws `InvalidOperationException` before sending any SQL (no rows
+  locked); saves, immediate dispatch and renewal still work, entity splitting of outbox columns and view/SQL-query/
+  function mappings (clear `InvalidOperationException`), value converters on
+  `Id`, `LockExpiresAt` or `Attemps` (untested).
 - `GetAllAsync(itemsCount: null)` claims every eligible row in one
   statement, with no `TOP` and no `ORDER BY` (SQL Server rejects `ORDER BY`
   in a CTE without `TOP`, error 1033); the result order is unspecified. On a

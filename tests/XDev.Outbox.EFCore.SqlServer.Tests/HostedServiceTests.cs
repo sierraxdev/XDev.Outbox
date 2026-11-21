@@ -31,6 +31,20 @@ public sealed class AsyncFailingSubscriber : ISubscriber<AsyncFailingEvent>
     }
 }
 
+/// <summary>Generic event whose full name exceeds the Type column; records into the shared probe as a ProbeEvent.</summary>
+public sealed class LongNamedUserSubscriber : ISubscriber<LongNamedEvent<User>>
+{
+    private readonly SubscriberProbe _probe;
+
+    public LongNamedUserSubscriber(SubscriberProbe probe) => _probe = probe;
+
+    public Task HandleEventAsync(LongNamedEvent<User> eventMessage, CancellationToken cancellationToken = default)
+    {
+        _probe.Record(new ProbeEvent { Text = "long:" + eventMessage.User?.Email, Number = eventMessage.User?.Id ?? -1 });
+        return Task.CompletedTask;
+    }
+}
+
 /// <summary>
 /// The real runtime on SQL Server: OutboxProcessorHostedService + MemoryMessageQueue + EventPublisher +
 /// EntityFrameworkOutboxStore. Only the immediate-dispatch path and the poller's first poll (at start) are used; the
@@ -116,6 +130,64 @@ public class HostedServiceTests : IClassFixture<SmokeDatabaseFixture>
 
             var received = Assert.Single(probe.Received);
             Assert.Equal("from the poller", received.Text);
+            Assert.Equal(42, received.Number);
+        }
+        finally
+        {
+            await Stop(services);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task HostedService_ImmediateDispatchOfAGenericEventWhoseFullNameExceedsTheColumn_InvokesSubscriberOnceAndDeletesTheRow()
+    {
+        Assert.True(typeof(LongNamedEvent<User>).AssemblyQualifiedName!.Length > 200, "Precondition: the full name must exceed the 200-character column.");
+        using var host = CreateHost();
+        var probe = host.Services.GetRequiredService<SubscriberProbe>();
+        var services = await Start(host);
+        try
+        {
+            await using (var scope = host.CreateScope())
+            {
+                var user = Graph.NewUser("generic-immediate@test");
+                scope.Db.Users.Add(user);
+                scope.Db.Outbox.AddEvent(new LongNamedEvent<User> { User = user });
+                await scope.Db.SaveChangesAsync();
+            }
+
+            await WaitUntil(() => probe.Received.Count >= 1 && host.OutboxRows().Count == 0, "subscriber invoked and row deleted");
+            await Task.Delay(300);
+
+            var received = Assert.Single(probe.Received);
+            Assert.Equal("long:generic-immediate@test", received.Text);
+            Assert.Equal(Assert.Single(host.Database.Users()).Id, received.Number);
+            Assert.Empty(host.OutboxRows());
+        }
+        finally
+        {
+            await Stop(services);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task HostedService_PendingRowWithAVersionLessGenericTypeNameAtStartup_IsClaimedByThePollerDispatchedOnceAndDeleted()
+    {
+        using var host = CreateHost();
+        host.Database.Execute(
+            $"INSERT INTO {host.OutboxTable} ([Type], [Payload], [Created], [LockExpiresAt]) VALUES (@type, @payload, @created, NULL)",
+            ("@type", OwnedSaveTests.LongNamedUserEventStoredName),
+            ("@payload", "{\"user\":{\"id\":42,\"email\":\"generic-poller@test\",\"orders\":[]}}"),
+            ("@created", DateTime.UtcNow));
+        var probe = host.Services.GetRequiredService<SubscriberProbe>();
+
+        var services = await Start(host);
+        try
+        {
+            await WaitUntil(() => probe.Received.Count >= 1 && host.OutboxRows().Count == 0, "poller dispatch and row deleted");
+            await Task.Delay(300);
+
+            var received = Assert.Single(probe.Received);
+            Assert.Equal("long:generic-poller@test", received.Text);
             Assert.Equal(42, received.Number);
         }
         finally

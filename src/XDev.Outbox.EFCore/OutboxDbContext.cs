@@ -205,6 +205,9 @@ namespace XDev.Outbox.EFCore
                 return plainResult;
             }
 
+            // Before any command, transaction or savepoint: a name the column cannot hold fails the whole save.
+            ThrowIfEventTypeNameTooLong(events);
+
             var callerTransaction = Database.CurrentTransaction;
             if (callerTransaction != null)
             {
@@ -286,6 +289,9 @@ namespace XDev.Outbox.EFCore
                 if (acceptAllChangesOnSuccess) MarkPendingChangesAccepted();
                 return plainResult;
             }
+
+            // Before any command, transaction or savepoint: a name the column cannot hold fails the whole save.
+            ThrowIfEventTypeNameTooLong(events);
 
             var callerTransaction = Database.CurrentTransaction;
             if (callerTransaction != null)
@@ -1291,13 +1297,127 @@ namespace XDev.Outbox.EFCore
             return $"UPDATE {OutboxSqlText.EscapeFormat(sql.DelimitIdentifier(table.Name, table.Schema))} SET {OutboxSqlText.EscapeFormat(sql.DelimitIdentifier(payloadColumn))} = {{0}} WHERE {OutboxSqlText.EscapeFormat(sql.DelimitIdentifier(idColumn))} = {{1}}";
         }
 
+        /// <summary>
+        /// The stored type name (version-less, see <see cref="OutboxTypeName"/>) of every event must fit the column
+        /// <c>OutboxMessage.Type</c> is mapped to (200 unless the consumer changed it, see <see cref="EventTypeNameMaxLength"/>;
+        /// no check without a limit). Checked on every provider, before anything is sent, so the save fails as a whole with
+        /// a clear message instead of a provider error (SQL Server) or a silently longer value (SQLite ignores the length).
+        /// </summary>
+        private void ThrowIfEventTypeNameTooLong(IReadOnlyList<object> events)
+        {
+            var property = Model.FindEntityType(typeof(OutboxMessage<TKey>))?.FindProperty(nameof(OutboxMessage<TKey>.Type));
+            var maxLength = EventTypeNameMaxLength(property, out var columnType);
+            if (maxLength == null) return;
+
+            var checkedTypes = new HashSet<Type>();
+            foreach (var @event in events)
+            {
+                var type = @event.GetType();
+                if (!checkedTypes.Add(type)) continue;
+
+                var name = OutboxTypeName.Get(type);
+                if (name.Length <= maxLength.Value) continue;
+
+                var keyName = CSharpTypeName(typeof(TKey));
+                var limit = columnType == null
+                    ? $"OutboxMessage<{keyName}>.Type allows at most {maxLength.Value}"
+                    : $"OutboxMessage<{keyName}>.Type allows at most {maxLength.Value} (column type '{columnType}')";
+                var raise = columnType == null
+                    ? $"modelBuilder.Entity<OutboxMessage<{keyName}>>().Property(x => x.Type).HasMaxLength(n), "
+                    : $"modelBuilder.Entity<OutboxMessage<{keyName}>>().Property(x => x.Type).HasColumnType(...) with a larger length, ";
+                throw new InvalidOperationException(
+                    $"The outbox event type '{name}' cannot be saved: its stored type name is {name.Length} characters long, " +
+                    $"but {limit}. Nothing was saved. " +
+                    "Use a shorter event type name (namespace, type or generic arguments), or raise the column length in your " +
+                    "DbContext's OnModelCreating, after base.OnModelCreating(modelBuilder): " +
+                    raise +
+                    "and add a migration that changes the column.");
+            }
+        }
+
+        /// <summary>
+        /// The length limit of the column <c>OutboxMessage.Type</c> is mapped to. An explicit column type
+        /// (<c>HasColumnType</c>) defines the column, so its length wins: <c>nvarchar(500)</c> or <c>varchar(500)</c> is
+        /// 500, <c>nvarchar(max)</c> or a type with no length concept (<c>TEXT</c>, <c>ntext</c>, <c>xml</c>, see
+        /// <see cref="UnboundedColumnTypes"/>) has no limit; a column type whose length cannot be read, including a
+        /// character type written without a length (<c>nvarchar</c>, <c>varchar</c>, <c>sysname</c>, any unknown name),
+        /// falls back to the max length (<paramref name="columnType"/> stays null), like a property without an explicit
+        /// column type (<c>HasMaxLength</c>, 200 by default; null: no limit).
+        /// </summary>
+        private static int? EventTypeNameMaxLength(IProperty property, out string columnType)
+        {
+            columnType = null;
+            if (property == null) return null;
+
+            // The annotation is set only by an explicit column type; the provider's default store type is not an annotation.
+            if (property.FindAnnotation(RelationalAnnotationNames.ColumnType)?.Value is string explicitType
+                && TryParseColumnTypeLength(explicitType, out var length))
+            {
+                if (length != null) columnType = explicitType;
+                return length;
+            }
+
+            return property.GetMaxLength();
+        }
+
+        /// <summary>
+        /// Store type names (compared case-insensitively, without parentheses) that have no length: SQL Server
+        /// <c>text</c>, <c>ntext</c>, <c>xml</c>; SQLite <c>TEXT</c>; PostgreSQL <c>text</c>, <c>citext</c>; MySQL
+        /// <c>mediumtext</c>, <c>longtext</c>. Any other type name without parentheses is not assumed to be unlimited
+        /// (SQL Server <c>nvarchar</c> alone is <c>nvarchar(1)</c>, <c>sysname</c> is <c>nvarchar(128)</c>).
+        /// </summary>
+        private static readonly HashSet<string> UnboundedColumnTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "text", "ntext", "xml", "citext", "mediumtext", "longtext",
+        };
+
+        /// <summary>
+        /// Reads the length of a store type: <c>nvarchar(500)</c> -> 500; <c>nvarchar(max)</c> or a type in
+        /// <see cref="UnboundedColumnTypes"/> -> null (no limit). False (the length cannot be read) for any other type
+        /// without parentheses (<c>nvarchar</c>, <c>sysname</c>) and when the parentheses hold anything else (for
+        /// example <c>decimal(18,2)</c>).
+        /// </summary>
+        private static bool TryParseColumnTypeLength(string storeType, out int? length)
+        {
+            length = null;
+            var open = storeType.IndexOf('(');
+            if (open < 0) return UnboundedColumnTypes.Contains(storeType.Trim());
+
+            var close = storeType.IndexOf(')', open + 1);
+            if (close < 0) return false;
+
+            var facet = storeType.Substring(open + 1, close - open - 1).Trim();
+            if (string.Equals(facet, "max", StringComparison.OrdinalIgnoreCase)) return true;
+
+            if (int.TryParse(facet, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsed) && parsed > 0)
+            {
+                length = parsed;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static string CSharpTypeName(Type type)
+        {
+            if (type == typeof(int)) return "int";
+            if (type == typeof(long)) return "long";
+            if (type == typeof(short)) return "short";
+            if (type == typeof(byte)) return "byte";
+            if (type == typeof(uint)) return "uint";
+            if (type == typeof(ulong)) return "ulong";
+            if (type == typeof(ushort)) return "ushort";
+            if (type == typeof(sbyte)) return "sbyte";
+            return type.Name;
+        }
+
         private ICollection<OutboxMessage<TKey>> ToOutboxMessageEntity(IReadOnlyList<object> events, TimeProvider timeProvider)
         {
             var outboxOptions = this.GetService<IOptions<OutboxConfiguration>>()?.Value;
 
             return events.Select(x => new OutboxMessage<TKey>
             {
-                Type = x.GetType().AssemblyQualifiedName,
+                Type = OutboxTypeName.Get(x.GetType()),
                 Payload = x,
                 Created = timeProvider.GetUtcNow().DateTime,
                 LockExpiresAt = timeProvider.GetUtcNow().DateTime + outboxOptions.MessageLockExpirationTimeSpan

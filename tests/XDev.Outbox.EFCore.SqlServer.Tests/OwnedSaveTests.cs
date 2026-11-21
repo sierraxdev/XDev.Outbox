@@ -6,7 +6,8 @@ namespace XDev.Outbox.EFCore.SqlServer.Tests;
 
 /// <summary>
 /// Library-owned saves on SQL Server (no caller transaction): every public overload, application-level retry after a
-/// failed attempt, a large batch, and an event type name longer than the Type column.
+/// failed attempt, a large batch, and event types whose full name is longer than the Type column (stored version-less,
+/// or rejected before any command when even that is too long).
 /// </summary>
 public class OwnedSaveTests : IClassFixture<SmokeDatabaseFixture>
 {
@@ -51,8 +52,8 @@ public class OwnedSaveTests : IClassFixture<SmokeDatabaseFixture>
 
         var rows = host.OutboxRows();
         Assert.Equal(2, rows.Count);
-        Assert.Equal(typeof(UserCreated).AssemblyQualifiedName, rows[0].Type);
-        Assert.Equal(typeof(OrderPlaced).AssemblyQualifiedName, rows[1].Type);
+        Assert.Equal(StoredTypeName.Of<UserCreated>(), rows[0].Type);
+        Assert.Equal(StoredTypeName.Of<OrderPlaced>(), rows[1].Type);
         GraphAssert.UserPayloadMatches(rows[0].Payload, users, orders);
         GraphAssert.OrderPayloadMatches(rows[1].Payload, orders);
         Assert.Contains("\"orders\"", rows[0].Payload); // the dependents are in the payload too
@@ -183,37 +184,86 @@ public class OwnedSaveTests : IClassFixture<SmokeDatabaseFixture>
         Assert.Equal(200, updates); // one UPDATE per message whose payload changed (documented behavior)
     }
 
+    /// <summary>The version-less name the library stores for <c>LongNamedEvent&lt;User&gt;</c> (196 characters; the full name is far longer).</summary>
+    public const string LongNamedUserEventStoredName =
+        "XDev.Outbox.EFCore.SqlServer.Tests.Infrastructure.LongNamedEvent`1[[XDev.Outbox.EFCore.SqlServer.Tests.Infrastructure.User, XDev.Outbox.EFCore.SqlServer.Tests]], XDev.Outbox.EFCore.SqlServer.Tests";
+
     [SqlServerTheory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task OwnedSave_WhenEventTypeNameExceeds200Characters_WholeSaveFailsAndNothingIsPersisted(bool async)
+    public async Task OwnedSave_WhenFullTypeNameExceeds200ButVersionLessNameFits_PersistsTheVersionLessNameInTheTypeColumn(bool async)
+    {
+        var eventType = typeof(LongNamedEvent<User>);
+        Assert.True(eventType.AssemblyQualifiedName!.Length > 200, "Precondition: the full name must exceed the 200-character column.");
+        Assert.True(LongNamedUserEventStoredName.Length <= 200, "Precondition: the version-less name must fit the column.");
+
+        using var host = CreateHost();
+        await using var scope = host.CreateScope();
+        var user = Graph.NewUser("long-fits@test", "o");
+        scope.Db.Users.Add(user);
+        scope.Db.Outbox.AddEvent(new LongNamedEvent<User> { User = user });
+
+        await Save.Invoke(scope.Db, async);
+
+        _output.WriteLine($"Full name length: {eventType.AssemblyQualifiedName.Length}; stored: {LongNamedUserEventStoredName.Length}");
+        var row = Assert.Single(host.OutboxRows());
+        Assert.Equal(LongNamedUserEventStoredName, row.Type);
+        Assert.Same(eventType, Type.GetType(row.Type!, throwOnError: true));
+        Assert.Equal(Assert.Single(host.Database.Users()).Id, Json.Parse(row.Payload!).GetProperty("user").GetProperty("id").GetInt32());
+        var enqueued = Assert.Single(host.Queue.Enqueued);
+        Assert.Equal(row.Id, enqueued.Id.ToString());
+        Assert.Equal("committed", enqueued.RowStateAtEnqueue);
+        Assert.Empty(scope.Db.Outbox.GetEvents());
+    }
+
+    [SqlServerTheory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Save_WhenVersionLessTypeNameStillExceeds200Characters_ThrowsInvalidOperationExceptionAndSendsNoCommand(bool callerTransaction, bool async)
     {
         var eventType = typeof(LongNamedEvent<Dictionary<string, List<KeyValuePair<int, Guid>>>>);
-        Assert.True(eventType.AssemblyQualifiedName!.Length > 200, "Precondition: the type name must exceed the 200-character column.");
 
         using var host = CreateHost();
         await using var scope = host.CreateScope();
         var user = Graph.NewUser("long@test", "o");
         scope.Db.Users.Add(user);
-        scope.Db.Outbox.AddEvent(Activator.CreateInstance(eventType)!);
+        var tooLong = Activator.CreateInstance(eventType)!;
+        scope.Db.Outbox.AddEvent(tooLong);
+
+        await using var tx = callerTransaction ? await scope.Db.Database.BeginTransactionAsync() : null;
+        host.Faults.ClearLog();
 
         var error = await Record.ExceptionAsync(() => Save.Invoke(scope.Db, async));
 
-        _output.WriteLine($"Type name length: {eventType.AssemblyQualifiedName.Length}");
         for (var e = error; e != null; e = e.InnerException) _output.WriteLine($"{e.GetType().FullName}: {e.Message}");
-        Assert.NotNull(error);
-        Assert.IsType<DbUpdateException>(error);
-        var sql = Assert.IsType<Microsoft.Data.SqlClient.SqlException>(error!.InnerException);
-        _output.WriteLine($"SqlException.Number = {sql.Number}");
-        Assert.Empty(host.Database.Users());
-        Assert.Empty(host.Database.Orders());
-        Assert.Empty(host.OutboxRows());
+        var invalid = Assert.IsType<InvalidOperationException>(error);
+        Assert.Contains("allows at most 200", invalid.Message);
+        Assert.Contains("HasMaxLength(", invalid.Message);
+        Assert.Empty(host.Faults.Commands); // no INSERT: nothing was sent
+        Assert.Empty(host.Faults.TransactionEvents); // no transaction or savepoint was created, rolled back or committed
         Assert.Empty(host.Queue.Enqueued);
-        Assert.Single(scope.Db.Outbox.GetEvents());
+        Assert.Equal(new[] { tooLong }, scope.Db.Outbox.GetEvents());
         Assert.Equal(EntityState.Added, scope.Db.Entry(user).State);
+        Assert.Empty(scope.Db.ChangeTracker.Entries<OutboxMessage<int>>());
 
-        var typeParameter = host.Faults.Commands.Where(c => SqlMatch.IsOutboxInsert(c.Sql))
-            .SelectMany(c => c.Parameters).First(p => p.ValueLength == eventType.AssemblyQualifiedName.Length);
-        _output.WriteLine($"Type parameter: {typeParameter.SqlDbType} size={typeParameter.Size} valueLength={typeParameter.ValueLength}");
+        if (tx != null)
+        {
+            // The caller transaction is still usable.
+            scope.Db.Outbox.ClearEvents();
+            scope.Db.Outbox.AddEvent(new UserCreated { User = user });
+            await Save.Invoke(scope.Db, async);
+            await tx.CommitAsync();
+            Assert.Single(host.Database.Users());
+            Assert.Equal(StoredTypeName.Of<UserCreated>(), Assert.Single(host.OutboxRows()).Type);
+            Assert.Single(host.Queue.Enqueued);
+        }
+        else
+        {
+            Assert.Empty(host.Database.Users());
+            Assert.Empty(host.Database.Orders());
+            Assert.Empty(host.OutboxRows());
+        }
     }
 }

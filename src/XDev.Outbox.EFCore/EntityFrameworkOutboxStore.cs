@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations.Schema;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -44,6 +45,17 @@ namespace XDev.Outbox.EFCore
 
         public async Task<IEnumerable<OutboxMessage<TKey>>> GetAllAsync(int? itemsCount = null, DateTime? lockExpiration = null, int? maxAttemps = null, CancellationToken cancellationToken = default)
         {
+            // The table and columns the model maps (HasColumnName, naming conventions), delimited. FromSqlRaw formats
+            // the text with the parameter placeholders, so braces in the identifiers are escaped. The CTE keeps '*' and
+            // the UPDATE 'OUTPUT INSERTED.*': EF materializes the entity from the model's default column names, so a
+            // table-specific column override is rejected before any SQL is sent (the claim would lock rows it cannot read).
+            var entityType = _dbContext.Model.FindEntityType(typeof(OutboxMessage<TKey>));
+            var table = OutboxSqlText.EscapeFormat(OutboxSqlText.DelimitedTableName(_dbContext, entityType));
+            var idColumn = OutboxSqlText.EscapeFormat(OutboxSqlText.DelimitedColumnName(_dbContext, entityType, nameof(OutboxMessage<TKey>.Id)));
+            var lockColumn = OutboxSqlText.EscapeFormat(OutboxSqlText.DelimitedColumnName(_dbContext, entityType, nameof(OutboxMessage<TKey>.LockExpiresAt)));
+            var attempsColumn = OutboxSqlText.EscapeFormat(OutboxSqlText.DelimitedColumnName(_dbContext, entityType, nameof(OutboxMessage<TKey>.Attemps)));
+            OutboxSqlText.ThrowIfTableSpecificColumnNames(entityType);
+
             var @params = new List<SqlParameter>()
             {
                 new SqlParameter("@dateTimeNow", _timeProvider.GetUtcNow().DateTime)
@@ -62,9 +74,6 @@ namespace XDev.Outbox.EFCore
                 @params.Add(new SqlParameter("@take", itemsCount.Value));
             }
 
-            // FromSqlRaw formats the text with the parameter placeholders, so braces in the table name are escaped.
-            var table = OutboxSqlText.EscapeFormat(
-                OutboxSqlText.DelimitedTableName(_dbContext, _dbContext.Model.FindEntityType(typeof(OutboxMessage<TKey>))));
             queryBuilder.AppendLine($"""
                     *
                     FROM {table} WITH (ROWLOCK, READPAST, UPDLOCK)
@@ -73,20 +82,20 @@ namespace XDev.Outbox.EFCore
 
             if (maxAttemps.HasValue)
             {
-                queryBuilder.AppendLine("  WHERE (Attemps IS NULL OR Attemps < @maxAttemps) AND (LockExpiresAt IS NULL OR LockExpiresAt < @dateTimeNow)");
+                queryBuilder.AppendLine($"  WHERE ({attempsColumn} IS NULL OR {attempsColumn} < @maxAttemps) AND ({lockColumn} IS NULL OR {lockColumn} < @dateTimeNow)");
                 @params.Add(new SqlParameter("@maxAttemps", maxAttemps.Value));
             }
             else
             {
-                queryBuilder.AppendLine("  WHERE (LockExpiresAt IS NULL OR LockExpiresAt < @dateTimeNow)");
+                queryBuilder.AppendLine($"  WHERE ({lockColumn} IS NULL OR {lockColumn} < @dateTimeNow)");
             }
 
             // SQL Server rejects ORDER BY in a CTE without TOP (error 1033): without a count every eligible row is
             // claimed and the order is unspecified.
             if (itemsCount.HasValue)
             {
-                queryBuilder.Append("""
-                            ORDER BY Id
+                queryBuilder.Append($"""
+                            ORDER BY {idColumn}
                         )
                     """);
             }
@@ -100,9 +109,9 @@ namespace XDev.Outbox.EFCore
 
             if (lockExpiration.HasValue)
             {
-                queryBuilder.Append("""
+                queryBuilder.Append($"""
                     UPDATE cte
-                    SET LockExpiresAt = @lockExpiration
+                    SET {lockColumn} = @lockExpiration
                     OUTPUT INSERTED.*;
                 """);
                 @params.Add(new SqlParameter("@lockExpiration", lockExpiration.Value));
@@ -153,9 +162,12 @@ namespace XDev.Outbox.EFCore
             var renewed = new Dictionary<TKey, DateTime>();
             if (expectedLocks.Count == 0) return renewed;
 
-            // Formatted with the parameter placeholders like the claim, so braces in the table name are escaped.
-            var table = OutboxSqlText.EscapeFormat(
-                OutboxSqlText.DelimitedTableName(_dbContext, _dbContext.Model.FindEntityType(typeof(OutboxMessage<TKey>))));
+            // The table and columns the model maps, delimited; formatted with the parameter placeholders like the claim,
+            // so braces in the identifiers are escaped.
+            var entityType = _dbContext.Model.FindEntityType(typeof(OutboxMessage<TKey>));
+            var table = OutboxSqlText.EscapeFormat(OutboxSqlText.DelimitedTableName(_dbContext, entityType));
+            var idColumn = OutboxSqlText.EscapeFormat(OutboxSqlText.DelimitedColumnName(_dbContext, entityType, nameof(OutboxMessage<TKey>.Id)));
+            var lockColumn = OutboxSqlText.EscapeFormat(OutboxSqlText.DelimitedColumnName(_dbContext, entityType, nameof(OutboxMessage<TKey>.LockExpiresAt)));
 
             foreach (var chunk in expectedLocks.Select((pair, index) => (pair, index)).GroupBy(x => x.index / RenewalChunkSize, x => x.pair))
             {
@@ -174,14 +186,15 @@ namespace XDev.Outbox.EFCore
                     i++;
                 }
 
+                // OUTPUT is aliased to RenewedLock's pinned column names, whatever the outbox columns are called.
                 var sql = $"""
                     UPDATE t
-                    SET LockExpiresAt = @lockExpiration
-                    OUTPUT INSERTED.Id AS Id, INSERTED.LockExpiresAt AS LockExpiresAt
+                    SET {lockColumn} = @lockExpiration
+                    OUTPUT INSERTED.{idColumn} AS [Id], INSERTED.{lockColumn} AS [LockExpiresAt]
                     FROM {table} AS t WITH (ROWLOCK)
                     INNER JOIN (VALUES {values}) AS v(Id, Expected)
-                        ON t.Id = v.Id
-                        AND t.LockExpiresAt BETWEEN DATEADD(millisecond, -5, v.Expected) AND DATEADD(millisecond, 5, v.Expected);
+                        ON t.{idColumn} = v.Id
+                        AND t.{lockColumn} BETWEEN DATEADD(millisecond, -5, v.Expected) AND DATEADD(millisecond, 5, v.Expected);
                     """;
 
                 var rows = await _dbContext.Database
@@ -213,10 +226,17 @@ namespace XDev.Outbox.EFCore
             }
         }
 
-        /// <summary>A row returned by the renewal statement's OUTPUT clause.</summary>
+        /// <summary>
+        /// A row returned by the renewal statement's OUTPUT clause. The column names are pinned with <c>[Column]</c> so
+        /// naming conventions (convention set plugins apply to <c>SqlQuery</c> types too) cannot rename them away
+        /// from the OUTPUT aliases.
+        /// </summary>
         internal sealed class RenewedLock
         {
+            [Column("Id")]
             public TKey Id { get; set; }
+
+            [Column("LockExpiresAt")]
             public DateTime LockExpiresAt { get; set; }
         }
 

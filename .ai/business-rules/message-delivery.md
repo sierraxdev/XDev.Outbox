@@ -74,7 +74,10 @@ Each rule is labeled:
   - Details are in `components/efcore-outbox-store.md`.
 - [Confirmed] Outbox entities are not left tracked by the DbContext after a
   save.
-- [Confirmed] Each persisted row stores `Type = event.GetType().AssemblyQualifiedName`
+- [Confirmed] Each persisted row stores `Type` = the event's assembly-qualified
+  type name without Version, Culture and PublicKeyToken at any level
+  (including generic arguments; since 2026-11-20, user decision; before, the
+  full `AssemblyQualifiedName`)
   and `Payload` = the event serialized as JSON with
   `OutboxConfiguration.SerializerOptions`: camelCase, enums as strings, nulls
   omitted, reference cycles ignored.
@@ -203,14 +206,36 @@ Each rule is labeled:
 
 ## Type Resolution
 
-- [Confirmed] Dispatch uses `Type.GetType(row.Type)`. If the type cannot be
+- [Confirmed] Dispatch resolves `row.Type` with `OutboxEventTypeResolver`
+  (since 2026-11-20): `Type.GetType` with an assembly resolver that first
+  loads by name (same as before), and only if that finds nothing looks in
+  already-loaded assemblies (same simple name; Version >= the requested one
+  and the same PublicKeyToken when given; default load context first, then
+  highest version, then load order). Plugins loaded after a failed lookup
+  and dynamic assemblies therefore resolve; a fallback costs a first-chance
+  `FileNotFoundException` and a scan per resolution (no caching, so failures
+  are never cached). Assembly names containing `]` are escaped inside generic
+  arguments (resolves on net8; on net9+ such names do not resolve in any
+  form). If the type cannot be
   loaded, the message fails each attempt until the maximum is reached. This
   happens when the type is renamed, moved to another namespace or assembly,
   or its assembly is not loaded.
-- [Confirmed] The `Type` column is `nvarchar(200)`. Assembly-qualified names
-  longer than 200 characters, such as generic events or long namespaces, fail
-  to insert. The insert shares the business transaction, so the whole
-  `SaveChangesAsync` fails, not just the outbox row.
+- [Confirmed] Version-less names resolve with `Type.GetType` on net8–net11
+  (generic arguments from other assemblies, CoreLib, strong-named framework
+  and package assemblies, nested types, arrays); they bind to whatever
+  assembly version is loaded. Rows with full names (written before
+  2026-11-20) still resolve.
+- [Confirmed] The `Type` column is `nvarchar(200)` (`HasMaxLength(200)`). If
+  the stored (version-less) name exceeds the model's max length, the save
+  throws `InvalidOperationException` before any command, transaction or
+  savepoint, on every provider including SQLite; the buffer and tracker are
+  unchanged. Consumers can raise the limit with
+  `modelBuilder.Entity<OutboxMessage<TKey>>().Property(x => x.Type).HasMaxLength(n)`
+  after `base.OnModelCreating` plus their own migration. An explicit
+  `HasColumnType` with a length (`nvarchar(500)`) sets the limit; `(max)` and
+  unbounded types (`text`, `ntext`, `xml`) mean no limit; a character type
+  without a length or an unreadable type falls back to `HasMaxLength`. (Before 2026-11-20, long names failed
+  the INSERT and the whole save with a SQL error.)
 
 ## Evidence
 

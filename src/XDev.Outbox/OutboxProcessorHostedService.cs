@@ -403,7 +403,7 @@ namespace XDev.Outbox
 
                 try
                 {
-                    var type = Type.GetType(message.Type);
+                    var type = OutboxEventTypeResolver.Resolve(message.Type);
                     if (type == null) throw new Exception($"Failed to load type {message.Type}");
 
                     object payloadObj = message.Payload;

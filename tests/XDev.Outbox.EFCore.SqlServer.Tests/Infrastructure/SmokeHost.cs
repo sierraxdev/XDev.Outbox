@@ -70,9 +70,10 @@ public sealed class SmokeHost<TKey, TContext> : IDisposable
     where TKey : struct
     where TContext : SmokeContextBase<TKey>
 {
-    private SmokeHost(SmokeDatabase database, ServiceProvider services, RecordingMessageQueue<TKey> queue, FaultInjector faults, string outboxTable)
+    private SmokeHost(SmokeDatabase database, ServiceProvider services, RecordingMessageQueue<TKey> queue, FaultInjector faults, string outboxTable, OutboxColumns outboxColumns)
     {
         OutboxTable = outboxTable;
+        OutboxColumns = outboxColumns;
         Database = database;
         Services = services;
         Queue = queue;
@@ -87,7 +88,10 @@ public sealed class SmokeHost<TKey, TContext> : IDisposable
     /// <summary>The outbox table as mapped by the model, delimited: [schema].[table].</summary>
     public string OutboxTable { get; }
 
-    public List<OutboxRow> OutboxRows() => Database.OutboxRows(OutboxTable);
+    /// <summary>The outbox columns as mapped by the model, delimited.</summary>
+    public OutboxColumns OutboxColumns { get; }
+
+    public List<OutboxRow> OutboxRows() => Database.OutboxRows(OutboxTable, OutboxColumns);
 
     public static SmokeHost<TKey, TContext> Create(SmokeDatabaseFixture fixture, SmokeHostOptions? options = null, Action<IServiceCollection>? configure = null)
     {
@@ -130,18 +134,20 @@ public sealed class SmokeHost<TKey, TContext> : IDisposable
 
         var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
         string outboxTable;
+        OutboxColumns outboxColumns;
         using (var scope = provider.CreateScope())
         {
             var context = scope.ServiceProvider.GetRequiredService<TContext>();
             fixture.EnsureTables(context);
             var entityType = context.Model.FindEntityType(typeof(OutboxMessage<TKey>))!;
             outboxTable = $"[{(entityType.GetSchema() ?? "dbo").Replace("]", "]]")}].[{entityType.GetTableName()!.Replace("]", "]]")}]";
+            outboxColumns = OutboxColumns.Of(entityType);
         }
         database.DeleteAllRows();
         faults.ClearLog();
-        queue.RowProbe = id => database.RowState(outboxTable, id!);
+        queue.RowProbe = id => database.RowState(outboxTable, id!, outboxColumns.Id);
 
-        return new SmokeHost<TKey, TContext>(database, provider, queue, faults, outboxTable);
+        return new SmokeHost<TKey, TContext>(database, provider, queue, faults, outboxTable, outboxColumns);
     }
 
     public SmokeScope<TContext> CreateScope() => new(Services.CreateAsyncScope());

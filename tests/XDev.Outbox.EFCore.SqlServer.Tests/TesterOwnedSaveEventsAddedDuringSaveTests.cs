@@ -77,10 +77,10 @@ public class TesterOwnedSaveEventsAddedDuringSaveTests : IClassFixture<SmokeData
 
         var rows = host.OutboxRows();
         Assert.Equal(3, rows.Count);
-        var orderIdsInPayloads = rows.Where(r => r.Type == typeof(OrderPlaced).AssemblyQualifiedName)
+        var orderIdsInPayloads = rows.Where(r => r.Type == StoredTypeName.Of<OrderPlaced>())
             .Select(r => Json.Parse(r.Payload!).GetProperty("order").GetProperty("id").GetInt32()).OrderBy(x => x);
         Assert.Equal(orders.Select(o => o.Id).OrderBy(x => x), orderIdsInPayloads);
-        Assert.All(rows.Where(r => r.Type == typeof(OrderPlaced).AssemblyQualifiedName),
+        Assert.All(rows.Where(r => r.Type == StoredTypeName.Of<OrderPlaced>()),
             r => Assert.Equal(dbUser.Id, Json.Parse(r.Payload!).GetProperty("order").GetProperty("userId").GetInt32()));
         var enqueued = host.Queue.Enqueued;
         Assert.Equal(rows.Select(r => r.Id), enqueued.Select(e => e.Id.ToString()));

@@ -183,7 +183,7 @@ public class TesterClaimWithoutItemsCountTests : IClassFixture<SmokeDatabaseFixt
 
     /// <summary>
     /// The SQL without a count has no TOP and no ORDER BY, keeps the locking hints and the lock update; the SQL with a
-    /// count keeps TOP (@take) and ORDER BY Id.
+    /// count keeps TOP (@take) and ORDER BY [Id] (the model's column, delimited).
     /// </summary>
     [SqlServerFact]
     public async Task GetAllAsync_ClaimSqlShape_WithAndWithoutCount()
@@ -209,10 +209,10 @@ public class TesterClaimWithoutItemsCountTests : IClassFixture<SmokeDatabaseFixt
         Assert.DoesNotContain("ORDER BY", withoutCount, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("TOP", withoutCount, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("WITH (ROWLOCK, READPAST, UPDLOCK)", withoutCount);
-        Assert.Contains("SET LockExpiresAt = @lockExpiration", withoutCount);
+        Assert.Contains("SET [LockExpiresAt] = @lockExpiration", withoutCount);
         Assert.Contains("OUTPUT INSERTED.*", withoutCount);
         Assert.Contains("TOP (@take)", withCount);
-        Assert.Contains("ORDER BY Id", withCount);
+        Assert.Contains("ORDER BY [Id]", withCount);
         Assert.Contains("WITH (ROWLOCK, READPAST, UPDLOCK)", withCount);
     }
 

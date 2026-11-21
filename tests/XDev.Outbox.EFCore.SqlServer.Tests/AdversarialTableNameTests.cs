@@ -151,7 +151,7 @@ public abstract class TableNameScenarioTests<TContext> where TContext : SmokeCon
         Assert.Equal("kept@test", Assert.Single(users).Email);
         var rows = host.OutboxRows();
         Assert.Equal(3, rows.Count);
-        GraphAssert.RowsMatch(rows.Where(r => r.Type != typeof(TextEvent).AssemblyQualifiedName), users, orders);
+        GraphAssert.RowsMatch(rows.Where(r => r.Type != StoredTypeName.Of<TextEvent>()), users, orders);
         Assert.Equal(rows.Select(r => r.Id), host.Queue.Enqueued.Select(e => e.Id.ToString()).OrderBy(x => int.Parse(x)));
 
         // Claim, record a failure on one message, delete another.

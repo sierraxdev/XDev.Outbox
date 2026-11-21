@@ -1,11 +1,31 @@
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
 
 namespace XDev.Outbox.EFCore.SqlServer.Tests.Infrastructure;
 
 public sealed record OutboxRow(string Id, string? Type, string? Payload, DateTime? LockExpiresAt, int? Attemps, bool? IsError, string? ErrorMessage);
+
+/// <summary>Delimited column names of the outbox table, as the model maps them, for raw test SQL.</summary>
+public sealed record OutboxColumns(string Id, string Type, string Payload, string Created, string LockExpiresAt, string Attemps, string IsError, string ErrorMessage)
+{
+    /// <summary>The library's default names (the property names).</summary>
+    public static OutboxColumns Default { get; } = new("[Id]", "[Type]", "[Payload]", "[Created]", "[LockExpiresAt]", "[Attemps]", "[IsError]", "[ErrorMessage]");
+
+    /// <summary>The column names <paramref name="entityType"/> maps in its own table (HasColumnName, conventions, table-specific overrides).</summary>
+    public static OutboxColumns Of(IEntityType entityType)
+    {
+        var table = StoreObjectIdentifier.Table(entityType.GetTableName()!, entityType.GetSchema());
+        string Column(string property)
+        {
+            var p = entityType.FindProperty(property)!;
+            return "[" + (p.GetColumnName(table) ?? p.GetColumnName()).Replace("]", "]]") + "]";
+        }
+        return new OutboxColumns(Column("Id"), Column("Type"), Column("Payload"), Column("Created"), Column("LockExpiresAt"), Column("Attemps"), Column("IsError"), Column("ErrorMessage"));
+    }
+}
 
 /// <summary>
 /// A throwaway database named <c>XDevOutboxSmoke_&lt;guid&gt;</c>. Inspection helpers use their own connection in
@@ -94,9 +114,14 @@ public sealed class SmokeDatabase
         return rows;
     }
 
-    /// <summary>Rows of an outbox table (delimited name, e.g. <c>[dbo].[OutboxMessages]</c>), ordered by Id.</summary>
-    public List<OutboxRow> OutboxRows(string table = "[dbo].[OutboxMessages]")
-        => Query($"SELECT [Id], [Type], [Payload], [LockExpiresAt], [Attemps], [IsError], [ErrorMessage] FROM {table} ORDER BY [Id]", r => new OutboxRow(
+    /// <summary>
+    /// Rows of an outbox table (delimited name, e.g. <c>[dbo].[OutboxMessages]</c>), ordered by Id. <paramref name="columns"/>
+    /// gives the delimited column names when the model renames them (default: the property names).
+    /// </summary>
+    public List<OutboxRow> OutboxRows(string table = "[dbo].[OutboxMessages]", OutboxColumns? columns = null)
+    {
+        var c = columns ?? OutboxColumns.Default;
+        return Query($"SELECT {c.Id}, {c.Type}, {c.Payload}, {c.LockExpiresAt}, {c.Attemps}, {c.IsError}, {c.ErrorMessage} FROM {table} ORDER BY {c.Id}", r => new OutboxRow(
             Convert.ToString(r.GetValue(0))!,
             r.IsDBNull(1) ? null : r.GetString(1),
             r.IsDBNull(2) ? null : r.GetString(2),
@@ -104,6 +129,7 @@ public sealed class SmokeDatabase
             r.IsDBNull(4) ? null : r.GetInt32(4),
             r.IsDBNull(5) ? null : r.GetBoolean(5),
             r.IsDBNull(6) ? null : r.GetString(6)));
+    }
 
     public List<(int Id, string Email)> Users(string table = "[dbo].[Users]")
         => Query($"SELECT [Id], [Email] FROM {table} ORDER BY [Id]", r => (r.GetInt32(0), r.GetString(1)));
@@ -115,11 +141,11 @@ public sealed class SmokeDatabase
     /// Whether an outbox row is visible to another connection right now: "committed", "absent", or "locked" when an
     /// open transaction holds it (no wait: LOCK_TIMEOUT 0, locking read committed).
     /// </summary>
-    public string RowState(string table, object id)
+    public string RowState(string table, object id, string idColumn = "[Id]")
     {
         try
         {
-            var count = Convert.ToInt32(Scalar($"SET LOCK_TIMEOUT 0; SELECT COUNT(*) FROM {table} WITH (READCOMMITTEDLOCK) WHERE [Id] = @id", ("@id", id)));
+            var count = Convert.ToInt32(Scalar($"SET LOCK_TIMEOUT 0; SELECT COUNT(*) FROM {table} WITH (READCOMMITTEDLOCK) WHERE {idColumn} = @id", ("@id", id)));
             return count == 1 ? "committed" : "absent";
         }
         catch (SqlException ex) when (ex.Number == 1222)

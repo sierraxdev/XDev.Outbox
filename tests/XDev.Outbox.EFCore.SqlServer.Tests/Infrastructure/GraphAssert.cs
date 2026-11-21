@@ -51,8 +51,8 @@ public static class GraphAssert
     {
         foreach (var row in rows)
         {
-            if (row.Type == typeof(UserCreated).AssemblyQualifiedName) UserPayloadMatches(row.Payload, users, orders);
-            else if (row.Type == typeof(OrderPlaced).AssemblyQualifiedName) OrderPayloadMatches(row.Payload, orders);
+            if (row.Type == StoredTypeName.Of<UserCreated>()) UserPayloadMatches(row.Payload, users, orders);
+            else if (row.Type == StoredTypeName.Of<OrderPlaced>()) OrderPayloadMatches(row.Payload, orders);
             else Assert.Fail("Unexpected outbox row type: " + row.Type);
         }
     }
